@@ -4,3 +4,5 @@ token.json
 .cache
 credential.txt
 credentials.json
+voices/
+*.onnx
