@@ -1,0 +1,6 @@
+.env
+.spotify_token
+token.json
+.cache
+credential.txt
+credentials.json
