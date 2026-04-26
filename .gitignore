@@ -6,3 +6,4 @@ credential.txt
 credentials.json
 voices/
 *.onnx
+*.onnx

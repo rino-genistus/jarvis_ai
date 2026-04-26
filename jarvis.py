@@ -7,7 +7,7 @@ import mlx_whisper
 from ollama import chat, ChatResponse
 import time
 import tempfile
-from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent
+from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent, ComputerControlAgent
 from datetime import datetime
 from kokoro import KPipeline
 import sounddevice as sd
@@ -55,6 +55,7 @@ websearch = WebSearchAgents()
 weather = WeatherSearch()
 spotify = SpotifyAgent()
 gmail = GmailAgent()
+computer = ComputerControlAgent()
 
 system_prompt = f"""
     You are JARVIS (Just A Rather Very Intelligent System), an advanced AI assistant built to serve as a highly capable, loyal, and intelligent personal assistant.
@@ -212,10 +213,10 @@ def record_audio_and_transcribe_mlx_whisper():
 
 def extract_important_messages(messages):
     """
-    Given the messages from the current chat, uses qwen2.5:7b model to review all messages and retreive list of meaningful messages
+    Given the messages from the current chat, uses qwen2.5:14b model to review all messages and retreive list of meaningful messages
     """
     response = chat(
-        model='qwen2.5:7b',
+        model='qwen2.5:14b',
         messages=[
             {
                 "role": "user",
@@ -321,6 +322,24 @@ def main_loop():
         'pause_song': spotify.pause_song,
         'shuffle': spotify.shuffle,
         'set_volume': spotify.set_volume,
+        'get_all_labels': gmail.get_all_labels,
+        'get_drafts':gmail.get_drafts,
+        'get_email_by_id':gmail.get_email_by_id,
+        'get_sender_profile':gmail.get_sender_profile,
+        'get_sent_emails':gmail.get_sent_emails,
+        'get_unread_emails':gmail.get_unread_emails,
+        'mark_as_read':gmail.mark_as_read,
+        'remove_email_from_trash':gmail.remove_email_from_trash,
+        'reply_to_email':gmail.reply_to_email,
+        'trash_email':gmail.trash_email,
+        'search_email':gmail.search_email,
+        'send_email':gmail.send_email,
+        'open_application':computer.open_application,
+        'close_application':computer.close_application,
+        'switch_application':computer.switch_application,
+        'list_open_applications':computer.list_open_applications,
+        'open_file': computer.open_file,
+        'create_file': computer.create_file,
     }
     while True:
         spoken = ""
@@ -334,7 +353,7 @@ def main_loop():
         messages.append({"role": "user", "content": transcribed_text})
         if intent == 'exit':
             #User is leaving or conversation is done
-            completion = chat(model="qwen2.5:7b", messages=messages)
+            completion = chat(model="qwen2.5:14b", messages=messages)
             spoken = completion.message.content or ""
             messages.append({"role": "assistant", "content": spoken})
             safe_speak(spoken)
@@ -354,7 +373,7 @@ def main_loop():
                 "content": f"[Today's date is {current_date}] {messages[-1]['content']}"
             }]
             response: ChatResponse = chat(
-                model='qwen2.5:7b',
+                model='qwen2.5:14b',
                 messages=dated_messages,
                 tools=[
                     calendar.create_event, 
@@ -371,6 +390,24 @@ def main_loop():
                     spotify.pause_song,
                     spotify.shuffle,
                     spotify.set_volume,
+                    gmail.send_email,
+                    gmail.search_email,
+                    gmail.get_all_labels,
+                    gmail.get_drafts,
+                    gmail.get_email_by_id,
+                    gmail.get_sender_profile,
+                    gmail.get_unread_emails,
+                    gmail.send_email,
+                    gmail.mark_as_read,
+                    gmail.reply_to_email,
+                    gmail.trash_email,
+                    gmail.get_sent_emails,
+                    computer.open_application,
+                    computer.close_application,
+                    computer.switch_application,
+                    computer.list_open_applications,
+                    computer.open_file,
+                    computer.create_file,
                 ],
             )
             messages.append({"role": "assistant", "content": response.message.content or ""})
@@ -388,14 +425,14 @@ def main_loop():
                     "content": "Summarize the tool results naturally in Jarvis's voice. Deliver the key points concisely, then offer one natural follow-up — like whether they want more detail on anything specific or if they want any action taken on the information given."
                 }) #Summarizes what was just done
 
-                follow_up: ChatResponse = chat(model='qwen2.5:7b', messages=messages)
+                follow_up: ChatResponse = chat(model='qwen2.5:14b', messages=messages)
                 spoken = follow_up.message.content or ""
                 messages.append({"role": "assistant", "content": spoken})
             else:
                 spoken = response.message.content or response.message.thinking or ""
 
         else:  # chat
-            response: ChatResponse = chat(model='qwen2.5:7b', messages=messages)
+            response: ChatResponse = chat(model='qwen2.5:14b', messages=messages)
             spoken = response.message.content or ""
             messages.append({"role": "assistant", "content": spoken})
 
@@ -408,15 +445,11 @@ def main_loop():
     return any(phrase in transcribed_text for phrase in EXIT_PHRASES)"""
 
 kokoro_ready.wait()
-#main_loop()
+computer._index_thread.join()
+main_loop()
 print(f"First Command: {time.time() - start_time:.2f}s")
-#spotify.shuffle(False)
-emails = gmail.get_unread_emails()
-for email in emails:
-    print(email.get("id"))
-#print(gmail.get_all_labels())
-#print(gmail.get_email_by_id('19db13ec2dccb18a'))
-#print(gmail.send_email("Hello, Test email", "rr1406@scarletmail.rutgers.edu", 'rgenistus@gmail.com'))
-print(gmail.get_sender_profile())
-#print(gmail.search_email(query="from: rinogenistus@gmail.com"))
-print(gmail.reply_to_email(email_id="19dbca5b6b521fab"))
+#print(computer.apps_dict)
+#computer.list_open_applications()
+
+#computer.directories.get("jarvis_ai"))
+#print(computer.create_file(file_name='test_file_1.txt', content="Created test file 1 content", location='/rino/jarvis_ai'))

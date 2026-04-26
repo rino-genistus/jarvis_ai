@@ -1,7 +1,7 @@
 import datetime
 import os.path
 from bs4 import BeautifulSoup
-
+import send2trash
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -15,8 +15,13 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import base64
 from email.message import EmailMessage
+import subprocess
+from AppKit import NSWorkspace
+from threading import Thread
+import json
 
 load_dotenv()
+DIRECTORY_CACHE = os.path.join(os.path.expanduser("~"), "jarvis_ai", "directory_cache.json")
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
@@ -468,65 +473,117 @@ class GmailAgent():
         Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID. 
         Use when user wants to respond to an email.
         """
-        
-        detail = self.service.users().messages().get(
-            userId="me",
-            id=email_id,
-            format="full"
-        ).execute()
+        detail = self.service.users().messages().get(userId='me', id=email_id, format='full').execute()
+        headers = {h['name']: h['value'] for h in detail['payload']['headers']}
+        reply_to = headers.get("From", "")
+        subject = headers.get("Subject", "")
+        if not subject.startswith("Re: "):
+            subject = "Re: " + subject
+        message_id = headers.get("Message-ID", "")
+        thread_id = detail['threadId']
 
-        headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-        
-        # Extract and decode body
-        body = ""
-        payload = detail.get("payload", {})
-        
-        if "parts" in payload:
-            for part in payload["parts"]:
-                if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                    break
-                elif part["mimeType"] == "text/html" and "data" in part.get("body", {}):
-                    html = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                    body = BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
-        elif "data" in payload.get("body", {}):
-            raw = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
-            if payload.get("mimeType") == "text/html":
-                body = BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
-            else:
-                body = raw
+        raw_message = (
+            f"To: {reply_to}\r\n"
+            f"Subject: {subject}\r\n"
+            f"In-Reply-To: {message_id}\r\n"
+            f"References: {message_id}\r\n"
+            f"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            f"{body}"
+        )
 
-        return {
-            "id": email_id,
-            "from": headers.get("From", ""),
-            "subject": headers.get("Subject", ""),
-            "date": headers.get("Date", ""),
-            "body": body[:3000]  # cap so it doesn't blow up context window
-        }
+        encoded = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
+        results = self.service.users().messages().send(userId='me', body={'raw': encoded, 'threadId': thread_id}).execute()
+        return results
     
-    def mark_as_read(email_id:str):
+    def mark_as_read(self, email_id:str):
         """
         Mark a specific email as read. Use when user asks to mark an email as read or after reading an email aloud.
         """
-        return
+        results = self.service.users().messages().modify(userId='me', id=email_id, body={"removeLabelIds":['UNREAD']}).execute()
+        return "Email marked as Read"
     
-    def delete_email(email_id:str):
+    def trash_email(self, email_id:str):
         """
         Move an email to trash. Use when user asks to delete, remove, or trash an email.
         """
-        return
+        results = self.service.users().messages().trash(userId='me', id=email_id).execute()
+        return 'Email has been moved to the trash'
     
-    def get_drafts(max_results: int = 100):
+    def remove_email_from_trash(self, email_id:str):
+        """
+        Move an email to trash. Use when user asks to delete, remove, or trash an email.
+        """
+        results = self.service.users().messages().untrash(userId='me', id=email_id).execute()
+        return 'Email has been removed from the trash'
+    
+    def get_drafts(self, max_results: int = 100):
         """
         Fetch saved email drafts. Use when user asks about drafts or wants to send a previously saved draft.
         """
-        return
+        results = self.service.users().messages().list(
+            userId="me", 
+            labelIds=['DRAFT'],
+            maxResults=max_results
+        ).execute()
+        
+        messages = results.get("messages", [])
+        if not messages:
+            return "No unread emails."
+        
+        emails = []
+        for msg in messages:
+            detail = self.service.users().messages().get(
+                userId="me", 
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"]
+            ).execute()
+            
+            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+            emails.append({
+                "id": msg["id"],
+                "from": headers.get("From", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "snippet": detail.get("snippet", "")
+            })
+        
+        return emails
     
-    def get_sent_emails(max_results: int = 100):
+    def get_sent_emails(self, max_results: int = 100):
         """
         Fetch recently sent emails. Use when user asks what emails they've sent or wants to check sent history.
         """
-        return
+        results = self.service.users().messages().list(
+            userId="me", 
+            labelIds=['SENT'],
+            maxResults=max_results
+        ).execute()
+        
+        messages = results.get("messages", [])
+        if not messages:
+            return "No unread emails."
+        
+        emails = []
+        for msg in messages:
+            detail = self.service.users().messages().get(
+                userId="me", 
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date", "To"]
+            ).execute()
+            
+            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+            print(headers)
+            emails.append({
+                "id": msg["id"],
+                "to": headers.get("To", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "snippet": detail.get("snippet", "")
+            })
+        
+        return emails
     
     def get_sender_profile(self):
         """
@@ -535,3 +592,185 @@ class GmailAgent():
         """
         results = self.service.users().getProfile(userId='me').execute()
         return results['emailAddress']
+
+
+class ComputerControlAgent():
+    #Subprocess
+    #PyAutoGUI
+    def __init__(self):
+        self.all_mac_apps = self.get_mac_apps()
+        self.apps_dict = {}
+        for app in self.all_mac_apps:
+            app_name_only = app.split("/")[-1].split(".")[0].lower()
+            self.apps_dict.update({app_name_only: app})
+        self.home = os.path.expanduser('~')
+        self.directories = {}
+        self._index_thread = Thread(target=self._build_index, daemon=True)
+        self._index_thread.start()
+    
+    def _build_index(self):
+        if os.path.exists(DIRECTORY_CACHE):
+            print("Loading Directory from Cache")
+            with open(DIRECTORY_CACHE, "r") as f:
+                self.directories = json.load(f)
+            print(f"Loaded {len(self.directories)} folders from cache")
+        else:
+            print("Building Index directory for the first time")
+            self.directories = self._index_directories()
+            with open(DIRECTORY_CACHE, "w") as f:
+                json.dump(self.directories, f)
+            print(f"File Index ready. {len(self.directories)} folders indexed.")
+        print("File Index ready.")
+
+    def _index_directories(self):
+        SKIP = {
+            ".git", ".venv", "__pycache__", "node_modules", 
+            ".Trash", "Library", ".cache", ".npm", ".conda"
+        }
+
+        directory_map = {}
+        for root, dirs, files in os.walk(self.home):
+            dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")]
+            for folder in dirs:
+                full_path = os.path.join(root, folder)
+                folder_key = folder.lower()
+
+                if folder_key in directory_map:
+                    if isinstance(directory_map[folder_key], list):
+                        directory_map[folder_key].append(full_path)
+                    else:
+                        directory_map[folder_key] = [directory_map[folder_key], full_path]
+                else:
+                    directory_map[folder_key] = full_path
+        return directory_map
+
+    def refresh_index(self):
+        """Delete cache and rebuild from scratch."""
+        if os.path.exists(DIRECTORY_CACHE):
+            os.remove(DIRECTORY_CACHE)
+        self.directories = self._index_directories()
+        with open(DIRECTORY_CACHE, "w") as f:
+            json.dump(self.directories, f)
+        print(f"Index rebuilt. {len(self.directories)} folders indexed.")
+
+    def get_mac_apps(self):
+        cmd = ['mdfind', "kMDItemKind == 'Application'"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        apps = result.stdout.splitlines()
+        return sorted(list(set(apps)))
+    
+    def open_application(self, app_name:str):
+        if app_name.lower() not in self.apps_dict.keys():
+            return "App not found"
+        subprocess.run(['open', '-a', self.apps_dict.get(app_name.lower())])
+        return f"{app_name} opened"
+    
+    def close_application(self, app_name:str):
+        """
+        Quit an open application by name.
+        Use when the user asks to close, quit, or exit an app.
+        """
+        if app_name.lower() not in self.apps_dict.keys():
+            return "App not found"
+        script = f'tell application "{app_name}" to quit'
+        subprocess.call(['osascript', '-e', script])
+        return f"{app_name} closed"
+
+    def switch_application(self, app_name:str):
+        script = f'tell application "{app_name}" to activate'
+        subprocess.run(['osascript', '-e', script])
+        return f"{app_name} brought to the front"
+    
+    def list_open_applications(self):
+        running_apps = NSWorkspace.sharedWorkspace().launchedApplications()
+        for app in running_apps:
+            print(f"Name: {app['NSApplicationName']}, Bundle ID: {app['NSApplicationBundleIdentifier']}")
+        return running_apps
+    
+    def open_file(self, file_path:str):
+        try:
+            file_path = os.path.expanduser(file_path)  
+            file_path = os.path.abspath(file_path)      
+            if not os.path.exists(file_path):
+                return f"File not found: {file_path}"
+            subprocess.Popen(['open', file_path])
+            return f"Opened {file_path}"
+        except Exception as e:
+            return f"Failed to open file: {e}"
+        
+    def create_file(self, file_name:str, content:str = "", location: str = 'desktop'):
+        """
+        Create a new file with optional content.
+        location can be a common directory name like 'desktop', 'documents', 'downloads',
+        or a specific folder name that exists on the system, or a full path.
+        """
+        if not self.directories:
+            self._index_thread.join()
+        location_key = location.lower()
+        if location_key in self.directories:
+            directory = self.directories[location_key]
+            if isinstance(directory, list):
+                return f"Multiple folders name '{location}' found: \n" + "\n".join(directory) + "\nWhich one did you mean? Provide the full path."
+        elif os.path.isabs(location):
+            directory = location
+        else:
+            matches = [v for k, v in self.directories.items() if location_key in k]
+            if matches:
+                directory = matches[0] if not isinstance(matches[0], list) else matches[0][0]
+            else:
+                return f"Could not find a directory matching '{location}'. Try providing a full path."
+        directory = os.path.expanduser(directory)
+        directory = os.path.abspath(directory)
+        if not os.path.exists(directory):
+            return f"Directory does not exist: {directory}"
+        file_path = os.path.join(directory, file_name)
+        if os.path.exists(file_path):
+            return f"File already exists at {file_path}. Choose a different name or location."
+        try:
+            with open(file_path, "w") as f:
+                f.write(content)
+            return f"Created {file_path}"
+        except PermissionError:
+            return f"Permission denied: cannot write to {directory}"
+        except Exception as e:
+            return f"Failed to create file: {e}"
+        
+    def delete_file(self, file_name:str, location:str):
+        """
+        Move a file to the trash. 
+        location can be a directory name like 'desktop', 'documents', or a full path.
+        """
+        if not self.directories:
+            self._index_thread.join()
+        location_key = location.lower()
+        if location_key in self.directories:
+            directory = self.directories[location_key]
+            if isinstance(directory, list):
+                return (
+                    f"Multiple folders named '{location}' found:\n" +
+                    "\n".join(f"{i+1}. {p}" for i, p in enumerate(directory)) +
+                    "\nWhich one did you mean? Provide the full path."
+                )
+        elif os.path.isabs(location):
+            directory = location
+        else:
+            matches = [v for k, v in self.directories.items() if location_key in k]
+            if matches:
+                directory = matches[0] if not isinstance(matches[0], list) else matches[0][0]
+            else:
+                return f"Could not find a directory matching '{location}'. Try providing a full path."
+        directory = os.path.expanduser(directory)
+        directory = os.path.abspath(directory)
+        if not os.path.exists(directory):
+            return f"Directory does not exist: {directory}"
+        file_path = os.path.join(directory, file_name)
+        if not os.path.exists(file_path):
+            return f"File not found: {file_path}"
+        try:
+            send2trash(file_path)
+            return f"Moved to trash: {file_path}"
+        except Exception as e:
+            return f"Failed to delete file: {e}"
+    
+    def move_file(source, destination):
+        return
