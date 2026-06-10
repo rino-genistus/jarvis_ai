@@ -1,7 +1,7 @@
 import datetime
 import os.path
-from bs4 import BeautifulSoup
 import send2trash
+import shutil
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -108,22 +108,16 @@ class Calendar_Agents():
             print(f"Failed to delete: {e}")
         return delete_event
     def update_calendar_event(self, event_id: str, updates: dict, calendar_id: str = "primary"):
-        # Get the full event first
         event = self.service.events().get(
             calendarId=calendar_id,
             eventId=event_id
         ).execute()
-        
-        # Merge your updates in
         event.update(updates)
-        
-        # Send it back
         updated_event = self.service.events().update(
             calendarId=calendar_id,
             eventId=event_id,
             body=event
         ).execute()
-        
         return updated_event
 
 class WebSearchAgents():
@@ -132,24 +126,23 @@ class WebSearchAgents():
         self.tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     def search_web(self, query: str):
         """
-        Search the web for current information, news, facts, or anything 
-        that requires up to date knowledge. Use this for weather, news, 
+        Search the web for current information, news, facts, or anything
+        that requires up to date knowledge. Use this for weather, news,
         prices, recent events, or any factual question.
         """
         response = self.tavily_client.search(
-            query = query, 
-            max_results = 5, 
-            include_answer = True, 
+            query = query,
+            max_results = 5,
+            include_answer = True,
             search_depth = 'advanced',
         )
         return response['answer']
     def extract_webpages(self, query: str):
         """
-        Use this when the user wants to read a full article, page, or document 
-        in detail — not just a quick answer. Searches for the best URL then 
+        Use this when the user wants to read a full article, page, or document
+        in detail — not just a quick answer. Searches for the best URL then
         extracts the full content.
         """
-        # Step 1 — find the best URL for the query
         search_results = self.tavily_client.search(
             query=query,
             max_results=1,
@@ -157,7 +150,6 @@ class WebSearchAgents():
         best_url = search_results["results"][0]["url"]
         print(f"Reading: {best_url}")
 
-        # Step 2 — extract full content from that page
         extracted = self.tavily_client.extract(best_url)
         return extracted["results"][0]["raw_content"]
     def crawl_webpages(self):
@@ -174,8 +166,8 @@ class WeatherSearch():
     def get_current_weather(self, latitude: float, longitude: float, exclude: list[str]):
         """
         Get the current weather and forecast for a location using its coordinates.
-        Use this for any question about current conditions, temperature, humidity, 
-        wind, or upcoming forecast. Exclude options: 'current', 'minutely', 'hourly', 
+        Use this for any question about current conditions, temperature, humidity,
+        wind, or upcoming forecast. Exclude options: 'current', 'minutely', 'hourly',
         'daily', 'alerts'.
         """
         exclude_str = ",".join(exclude) if exclude else ""
@@ -184,7 +176,7 @@ class WeatherSearch():
     def get_weather_with_time(self, latitude: float, longitude: float, target_hour: str):
         """
         Get the hourly weather forecast for a specific hour today.
-        Use this when the user asks about weather at a specific time, 
+        Use this when the user asks about weather at a specific time,
         e.g. 'what will the weather be at 10pm tonight'.
         target_hour should be in 24-hour format (0-23) in the location's local time.
         """
@@ -192,7 +184,7 @@ class WeatherSearch():
         response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?{params}")
         data = response.json()
 
-        timezone_offset = data.get("timezone_offset", 0)  # seconds offset from UTC
+        timezone_offset = data.get("timezone_offset", 0)
         hourly = data.get("hourly", [])
 
         for hour in hourly:
@@ -204,7 +196,7 @@ class WeatherSearch():
     def get_daily_forecast(self, latitude: float, longitude: float, days: int = 7):
         """
         Get the daily weather forecast for the next N days (max 8).
-        Use this when the user asks about weather over multiple days, 
+        Use this when the user asks about weather over multiple days,
         a specific day this week, or a general weekly forecast.
         days should be between 1 and 8.
         """
@@ -214,23 +206,22 @@ class WeatherSearch():
 
         daily = data.get("daily", [])
         return daily[:days]
-    
-    def get_weather_alerts(self, latitude: float, longitude: float,):
+
+    def get_weather_alerts(self, latitude: float, longitude: float):
         """
         Get any active severe weather alerts for a location.
-        Use this when the user asks about weather warnings, storms, 
+        Use this when the user asks about weather warnings, storms,
         advisories, or any severe weather in their area.
         """
-        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&units=imperial&appid={os.getenv('OPENWEATHER_API_KEY')}")
+        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&units=imperial&exclude=current,minutely,hourly,daily&appid={os.getenv('OPENWEATHER_API_KEY')}")
         data = response.json()
         alerts = data.get('alerts', [])
         if not alerts:
             return "No active weather alerts for this location"
-        else:
-            return alerts
+        return alerts
 
 class SpotifyAgent():
-    
+
     def __init__(self):
         self.sp = None
         self._setup()
@@ -261,7 +252,7 @@ class SpotifyAgent():
             return "Spotify not Connected"
         results = self.sp.current_user_playing_track()
         return results
-    
+
     def search_song_and_queue(self, query: str = ''):
         """
         Search for a song on Spotify by name or artist and return its URI.
@@ -279,18 +270,21 @@ class SpotifyAgent():
 
         try:
             self.sp.add_to_queue(track['uri'])
-            return f"Added '{track_name}' by {artist_name} to your queue."  # ← return actual track info
+            return f"Added '{track_name}' by {artist_name} to your queue."
         except spotipy.exceptions.SpotifyException as e:
             if "NO_ACTIVE_DEVICE" in str(e):
                 return f"Found '{track_name}' by {artist_name} but Spotify has no active device. Open Spotify and start playing something first."
             return f"Spotify error: {str(e)}"
-        
-    def create_playlist(self, playlist_name: str, public: bool = True, collaborative: bool = True, description: str = ""):
+
+    def create_playlist(self, playlist_name: str, public: bool = False, collaborative: bool = False, description: str = ""):
         """
-        Create a playlist with the playlist name provided, public boolean if provided, collaborative if provided and description if provided
+        Create a playlist with the given name. collaborative playlists must be private —
+        if collaborative is True, public is forced to False.
         """
         if not self.sp:
             return "Spotify is not connected"
+        if collaborative:
+            public = False
         user_id = self.sp.current_user()["id"]
         playlist = self.sp.user_playlist_create(
             user=user_id,
@@ -301,7 +295,7 @@ class SpotifyAgent():
         )
         return {"name": playlist["name"], "id": playlist["id"], "url": playlist["external_urls"]["spotify"]}
 
-    
+
     def recently_played(self, limit: int = 25):
         """
         Returns the recently played songs
@@ -317,7 +311,7 @@ class SpotifyAgent():
             }
             for item in results['items']
         ]
-    
+
     def add_song_to_playlist(self, track_name: str, playlist_name: str, limit: int = 1000):
         """
         Adds song to playlist of user's choice. Retrieves song uri and playlist uri if playlist exists and then adds song to the playlist
@@ -325,14 +319,6 @@ class SpotifyAgent():
         if not self.sp:
             return "Spotify is not connected"
         current_user_playlists = self.sp.current_user_playlists()
-        #print(current_user_playlists)
-        """results = [
-            {
-                "name": item['name'],
-                "playlist_uri": item['uri']
-            }
-            for item in current_user_playlists['items']
-        ]"""
         playlist_names = [item['name'] for item in current_user_playlists['items']]
         if playlist_name not in playlist_names:
             return "Playlist does not exist."
@@ -341,7 +327,7 @@ class SpotifyAgent():
         track_uri = results['tracks']['items'][0]['uri']
         self.sp.playlist_add_items(playlist_id=playlist_uri, items=[track_uri])
         return f"Added {track_name} to {playlist_name}"
-    
+
     def skip_song(self):
         """
         Skips currently playing song
@@ -349,7 +335,7 @@ class SpotifyAgent():
         if not self.sp:
             return "Spotify is not connected"
         self.sp.next_track()
-    
+
     def pause_song(self):
         """
         Pauses currently playing song
@@ -375,17 +361,17 @@ class SpotifyAgent():
             return "Spotify is not connected"
         self.sp.volume(volume_percent=volume)
         return f"Playback volume set to {volume}"
-    
+
 class GmailAgent():
 
     def __init__(self):
         self.service = self._setup()
     def _setup(self):
         return build("gmail", "v1", credentials=get_google_creds())
-    
+
     def search_email(self, query:str = "", max_results:int = 10):
         """
-        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'. 
+        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'.
         Use when user references an email by sender, topic, or keyword.
         """
         results = self.service.users().messages().list(q=query, userId='me', labelIds=['INBOX']).execute()
@@ -397,7 +383,7 @@ class GmailAgent():
             msg_content = self.service.users().messages().get(userId='me', id=msg['id']).execute()
             messages_dict.update({msg['id']: msg_content['snippet']})
         return messages_dict
-    
+
     def send_email(self, content: str, to: str = "", cc:str = "", bcc:str = "", subject: str = ""):
         '''
         Compose and send a new email. Use when user asks to send, write, or compose an email to someone.
@@ -413,31 +399,31 @@ class GmailAgent():
         create_message = {"raw": encoded_message}
         results = self.service.users().messages().send(userId='me', body=create_message).execute()
         print(results)
-    
+
     def get_unread_emails(self, max_results: int = 10):
         """
-        Fetch unread emails from inbox. Returns sender, subject, date, snippet, and ID for each. 
+        Fetch unread emails from inbox. Returns sender, subject, date, snippet, and ID for each.
         Use when user asks about new or unread emails.
         """
         results = self.service.users().messages().list(
-            userId="me", 
+            userId="me",
             labelIds=['UNREAD'],
             maxResults=max_results
         ).execute()
-        
+
         messages = results.get("messages", [])
         if not messages:
             return "No unread emails."
-        
+
         emails = []
         for msg in messages:
             detail = self.service.users().messages().get(
-                userId="me", 
+                userId="me",
                 id=msg["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date"]
             ).execute()
-            
+
             headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
             emails.append({
                 "id": msg["id"],
@@ -446,31 +432,54 @@ class GmailAgent():
                 "date": headers.get("Date", ""),
                 "snippet": detail.get("snippet", "")
             })
-        
+
         return emails
-    
+
     def get_email_by_id(self, email_id: str):
         """
-        Fetch the full body of a specific email by its ID. 
+        Fetch the full body of a specific email by its ID.
         Always call this after get_unread_emails or search_emails when the user wants to read the actual content.
         """
         detail = self.service.users().messages().get(
-                    userId="me", 
-                    id=email_id,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"]
-                ).execute()
-        return detail
-    
+            userId="me",
+            id=email_id,
+            format="full"
+        ).execute()
+
+        payload = detail.get("payload", {})
+        headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+
+        body = ""
+        parts = payload.get("parts", [])
+        if parts:
+            for part in parts:
+                if part.get("mimeType") == "text/plain":
+                    data = part.get("body", {}).get("data", "")
+                    if data:
+                        body = base64.urlsafe_b64decode(data).decode("utf-8")
+                        break
+        else:
+            data = payload.get("body", {}).get("data", "")
+            if data:
+                body = base64.urlsafe_b64decode(data).decode("utf-8")
+
+        return {
+            "id": email_id,
+            "from": headers.get("From", ""),
+            "subject": headers.get("Subject", ""),
+            "date": headers.get("Date", ""),
+            "body": body,
+            "snippet": detail.get("snippet", "")
+        }
+
     def get_all_labels(self):
         results = self.service.users().labels().list(userId="me").execute()
         labels = results.get('labels', [])
-        labels = labels[:-1]
         return [label['name'] for label in labels]
-    
+
     def reply_to_email(self,email_id:str = "", body:str = ""):
         """
-        Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID. 
+        Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID.
         Use when user wants to respond to an email.
         """
         detail = self.service.users().messages().get(userId='me', id=email_id, format='full').execute()
@@ -494,51 +503,51 @@ class GmailAgent():
         encoded = base64.urlsafe_b64encode(raw_message.encode("utf-8")).decode("utf-8")
         results = self.service.users().messages().send(userId='me', body={'raw': encoded, 'threadId': thread_id}).execute()
         return results
-    
+
     def mark_as_read(self, email_id:str):
         """
         Mark a specific email as read. Use when user asks to mark an email as read or after reading an email aloud.
         """
         results = self.service.users().messages().modify(userId='me', id=email_id, body={"removeLabelIds":['UNREAD']}).execute()
         return "Email marked as Read"
-    
+
     def trash_email(self, email_id:str):
         """
         Move an email to trash. Use when user asks to delete, remove, or trash an email.
         """
         results = self.service.users().messages().trash(userId='me', id=email_id).execute()
         return 'Email has been moved to the trash'
-    
+
     def remove_email_from_trash(self, email_id:str):
         """
-        Move an email to trash. Use when user asks to delete, remove, or trash an email.
+        Restore an email from trash. Use when user asks to undelete or recover a trashed email.
         """
         results = self.service.users().messages().untrash(userId='me', id=email_id).execute()
         return 'Email has been removed from the trash'
-    
+
     def get_drafts(self, max_results: int = 100):
         """
         Fetch saved email drafts. Use when user asks about drafts or wants to send a previously saved draft.
         """
         results = self.service.users().messages().list(
-            userId="me", 
+            userId="me",
             labelIds=['DRAFT'],
             maxResults=max_results
         ).execute()
-        
+
         messages = results.get("messages", [])
         if not messages:
-            return "No unread emails."
-        
+            return "No drafts found."
+
         emails = []
         for msg in messages:
             detail = self.service.users().messages().get(
-                userId="me", 
+                userId="me",
                 id=msg["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date"]
             ).execute()
-            
+
             headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
             emails.append({
                 "id": msg["id"],
@@ -547,34 +556,33 @@ class GmailAgent():
                 "date": headers.get("Date", ""),
                 "snippet": detail.get("snippet", "")
             })
-        
+
         return emails
-    
+
     def get_sent_emails(self, max_results: int = 100):
         """
         Fetch recently sent emails. Use when user asks what emails they've sent or wants to check sent history.
         """
         results = self.service.users().messages().list(
-            userId="me", 
+            userId="me",
             labelIds=['SENT'],
             maxResults=max_results
         ).execute()
-        
+
         messages = results.get("messages", [])
         if not messages:
-            return "No unread emails."
-        
+            return "No sent emails found."
+
         emails = []
         for msg in messages:
             detail = self.service.users().messages().get(
-                userId="me", 
+                userId="me",
                 id=msg["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date", "To"]
             ).execute()
-            
+
             headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-            print(headers)
             emails.append({
                 "id": msg["id"],
                 "to": headers.get("To", ""),
@@ -582,12 +590,12 @@ class GmailAgent():
                 "date": headers.get("Date", ""),
                 "snippet": detail.get("snippet", "")
             })
-        
+
         return emails
-    
+
     def get_sender_profile(self):
         """
-        Returns the email address of the currently authenticated Gmail account. 
+        Returns the email address of the currently authenticated Gmail account.
         Call this before sending if the user hasn't specified which account to use, so you can confirm with them.
         """
         results = self.service.users().getProfile(userId='me').execute()
@@ -595,8 +603,6 @@ class GmailAgent():
 
 
 class ComputerControlAgent():
-    #Subprocess
-    #PyAutoGUI
     def __init__(self):
         self.all_mac_apps = self.get_mac_apps()
         self.apps_dict = {}
@@ -607,7 +613,7 @@ class ComputerControlAgent():
         self.directories = {}
         self._index_thread = Thread(target=self._build_index, daemon=True)
         self._index_thread.start()
-    
+
     def _build_index(self):
         if os.path.exists(DIRECTORY_CACHE):
             print("Loading Directory from Cache")
@@ -620,11 +626,10 @@ class ComputerControlAgent():
             with open(DIRECTORY_CACHE, "w") as f:
                 json.dump(self.directories, f)
             print(f"File Index ready. {len(self.directories)} folders indexed.")
-        print("File Index ready.")
 
     def _index_directories(self):
         SKIP = {
-            ".git", ".venv", "__pycache__", "node_modules", 
+            ".git", ".venv", "__pycache__", "node_modules",
             ".Trash", "Library", ".cache", ".npm", ".conda"
         }
 
@@ -658,13 +663,13 @@ class ComputerControlAgent():
         result = subprocess.run(cmd, capture_output=True, text=True)
         apps = result.stdout.splitlines()
         return sorted(list(set(apps)))
-    
+
     def open_application(self, app_name:str):
         if app_name.lower() not in self.apps_dict.keys():
             return "App not found"
         subprocess.run(['open', '-a', self.apps_dict.get(app_name.lower())])
         return f"{app_name} opened"
-    
+
     def close_application(self, app_name:str):
         """
         Quit an open application by name.
@@ -680,24 +685,26 @@ class ComputerControlAgent():
         script = f'tell application "{app_name}" to activate'
         subprocess.run(['osascript', '-e', script])
         return f"{app_name} brought to the front"
-    
+
     def list_open_applications(self):
-        running_apps = NSWorkspace.sharedWorkspace().launchedApplications()
-        for app in running_apps:
-            print(f"Name: {app['NSApplicationName']}, Bundle ID: {app['NSApplicationBundleIdentifier']}")
-        return running_apps
-    
+        running_apps = NSWorkspace.sharedWorkspace().runningApplications()
+        return [
+            {"name": str(app.localizedName()), "bundle_id": str(app.bundleIdentifier())}
+            for app in running_apps
+            if app.localizedName()
+        ]
+
     def open_file(self, file_path:str):
         try:
-            file_path = os.path.expanduser(file_path)  
-            file_path = os.path.abspath(file_path)      
+            file_path = os.path.expanduser(file_path)
+            file_path = os.path.abspath(file_path)
             if not os.path.exists(file_path):
                 return f"File not found: {file_path}"
             subprocess.Popen(['open', file_path])
             return f"Opened {file_path}"
         except Exception as e:
             return f"Failed to open file: {e}"
-        
+
     def create_file(self, file_name:str, content:str = "", location: str = 'desktop'):
         """
         Create a new file with optional content.
@@ -734,10 +741,10 @@ class ComputerControlAgent():
             return f"Permission denied: cannot write to {directory}"
         except Exception as e:
             return f"Failed to create file: {e}"
-        
+
     def delete_file(self, file_name:str, location:str):
         """
-        Move a file to the trash. 
+        Move a file to the trash.
         location can be a directory name like 'desktop', 'documents', or a full path.
         """
         if not self.directories:
@@ -767,10 +774,49 @@ class ComputerControlAgent():
         if not os.path.exists(file_path):
             return f"File not found: {file_path}"
         try:
-            send2trash(file_path)
+            send2trash.send2trash(file_path)
             return f"Moved to trash: {file_path}"
         except Exception as e:
             return f"Failed to delete file: {e}"
-    
-    def move_file(source, destination):
-        return
+
+    def move_file(self, source: str, destination: str):
+        """
+        Move a file from its current location to a destination directory.
+        source should be the full path to the file.
+        destination can be a directory name like 'desktop', 'documents', or a full path.
+        """
+        if not self.directories:
+            self._index_thread.join()
+        source = os.path.expanduser(source)
+        source = os.path.abspath(source)
+        if not os.path.exists(source):
+            return f"Source file not found: {source}"
+
+        destination_key = destination.lower()
+        if destination_key in self.directories:
+            dest_dir = self.directories[destination_key]
+            if isinstance(dest_dir, list):
+                return (
+                    f"Multiple folders named '{destination}' found:\n" +
+                    "\n".join(f"{i+1}. {p}" for i, p in enumerate(dest_dir)) +
+                    "\nWhich one did you mean? Provide the full path."
+                )
+        elif os.path.isabs(destination):
+            dest_dir = destination
+        else:
+            matches = [v for k, v in self.directories.items() if destination_key in k]
+            if matches:
+                dest_dir = matches[0] if not isinstance(matches[0], list) else matches[0][0]
+            else:
+                return f"Could not find a directory matching '{destination}'. Try providing a full path."
+
+        dest_dir = os.path.expanduser(dest_dir)
+        dest_dir = os.path.abspath(dest_dir)
+        if not os.path.exists(dest_dir):
+            return f"Destination directory does not exist: {dest_dir}"
+
+        try:
+            dest_path = shutil.move(source, dest_dir)
+            return f"Moved to {dest_path}"
+        except Exception as e:
+            return f"Failed to move file: {e}"
