@@ -6,3 +6,9 @@ credential.txt
 credentials.json
 voices/
 *.onnx
+__pycache__/
+*.pyc
+logs/
+state.json
+directory_cache.json
+Jarvis.app/

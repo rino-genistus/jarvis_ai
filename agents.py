@@ -191,7 +191,9 @@ class WeatherSearch():
         hourly = data.get("hourly", [])
 
         for hour in hourly:
-            local_dt = datetime.datetime.utcfromtimestamp(hour["dt"] + timezone_offset)
+            local_dt = datetime.datetime.fromtimestamp(
+                hour["dt"] + timezone_offset, tz=datetime.timezone.utc
+            )
             if local_dt.hour == int(target_hour):
                 return hour
 
@@ -251,19 +253,39 @@ class SpotifyAgent():
             print(f"Spotify setup failed: {e}")
             self.sp = None
 
+    def _device_check(self):
+        """
+        Playback commands silently fail with no active device — detect that up
+        front so Jarvis can tell the user instead of going quiet.
+        Returns an error string, or None when a device is active.
+        """
+        if not self.sp:
+            return "Spotify is not connected"
+        try:
+            devices = self.sp.devices().get("devices", [])
+        except Exception as e:
+            return f"Could not reach Spotify: {e}"
+        if not any(d.get("is_active") for d in devices):
+            names = ", ".join(d.get("name", "?") for d in devices)
+            hint = f" Available devices: {names}." if names else ""
+            return ("No active Spotify device — ask the user to open Spotify and "
+                    "start playback on a device first." + hint)
+        return None
+
     def get_current_track(self):
         if not self.sp:
             return "Spotify not Connected"
         results = self.sp.current_user_playing_track()
         return results
-    
+
     def search_song_and_queue(self, query: str = ''):
         """
         Search for a song on Spotify by name or artist and return its URI.
         Always call this first before adding to queue or playlist to get the track URI.
         """
-        if not self.sp:
-            return "Spotify is not connected"
+        device_error = self._device_check()
+        if device_error:
+            return device_error
         results = self.sp.search(query, limit=1, type='track')
         tracks = results['tracks']['items']
         if not tracks:
@@ -341,33 +363,44 @@ class SpotifyAgent():
         """
         Skips currently playing song
         """
-        if not self.sp:
-            return "Spotify is not connected"
+        device_error = self._device_check()
+        if device_error:
+            return device_error
         self.sp.next_track()
-    
+        return "Skipped."
+
     def pause_song(self):
         """
         Pauses currently playing song
         If user wants to pause, call this method. If user wants to resume playing call this method.
         """
-        if not self.sp:
-            return "Spotify is not connected"
-        self.sp.pause_playback()
+        device_error = self._device_check()
+        if device_error:
+            return device_error
+        playback = self.sp.current_playback()
+        if playback and playback.get("is_playing"):
+            self.sp.pause_playback()
+            return "Paused."
+        self.sp.start_playback()
+        return "Resumed."
 
     def shuffle(self, shuffle_on: bool = False):
         """
         Turn shuffle on if shuffle is off and turns shuffle off if shuffle is on.
         """
-        if not self.sp:
-            return "Spotify is not connected"
+        device_error = self._device_check()
+        if device_error:
+            return device_error
         self.sp.shuffle(state=shuffle_on)
+        return f"Shuffle {'on' if shuffle_on else 'off'}."
 
     def set_volume(self, volume: int = 50):
         """
         Set volume of playback on device. Values between 0 to 100
         """
-        if not self.sp:
-            return "Spotify is not connected"
+        device_error = self._device_check()
+        if device_error:
+            return device_error
         self.sp.volume(volume_percent=volume)
         return f"Playback volume set to {volume}"
     
@@ -378,21 +411,62 @@ class GmailAgent():
     def _setup(self):
         return build("gmail", "v1", credentials=get_google_creds())
     
+    @staticmethod
+    def _extract_body(payload: dict) -> str:
+        """Pull readable text out of a message payload (plain text preferred over HTML)."""
+        if "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
+                    return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/html" and "data" in part.get("body", {}):
+                    html = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
+                    return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+                if "parts" in part:  # nested multipart
+                    nested = GmailAgent._extract_body(part)
+                    if nested:
+                        return nested
+        elif "data" in payload.get("body", {}):
+            raw = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
+            if payload.get("mimeType") == "text/html":
+                return BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
+            return raw
+        return ""
+
+    def _list_messages(self, label_ids=None, query: str = "", max_results: int = 10):
+        """Shared list+metadata fetch used by search/unread/sent/drafts views."""
+        results = self.service.users().messages().list(
+            userId="me",
+            q=query or None,
+            labelIds=label_ids or [],
+            maxResults=max_results,
+        ).execute()
+        messages = results.get("messages", [])
+        emails = []
+        for msg in messages:
+            detail = self.service.users().messages().get(
+                userId="me", id=msg["id"], format="metadata",
+                metadataHeaders=["From", "To", "Subject", "Date"],
+            ).execute()
+            headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+            emails.append({
+                "id": msg["id"],
+                "from": headers.get("From", ""),
+                "to": headers.get("To", ""),
+                "subject": headers.get("Subject", ""),
+                "date": headers.get("Date", ""),
+                "snippet": detail.get("snippet", ""),
+            })
+        return emails
+
     def search_email(self, query:str = "", max_results:int = 10):
         """
-        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'. 
+        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'.
         Use when user references an email by sender, topic, or keyword.
         """
-        results = self.service.users().messages().list(q=query, userId='me', labelIds=['INBOX']).execute()
-        messages = results.get('messages', [])
-        messages_dict = {}
-        if not messages:
-            return "No Messages found"
-        for msg in messages:
-            msg_content = self.service.users().messages().get(userId='me', id=msg['id']).execute()
-            messages_dict.update({msg['id']: msg_content['snippet']})
-        return messages_dict
-    
+        emails = self._list_messages(label_ids=["INBOX"], query=query, max_results=max_results)
+        return emails or "No Messages found"
+
     def send_email(self, content: str, to: str = "", cc:str = "", bcc:str = "", subject: str = ""):
         '''
         Compose and send a new email. Use when user asks to send, write, or compose an email to someone.
@@ -401,13 +475,15 @@ class GmailAgent():
         message.set_content(content)
         message['To'] = to
         message['Subject'] = subject
-        message['Cc'] = cc
-        message['Bcc'] = bcc
+        if cc:
+            message['Cc'] = cc
+        if bcc:
+            message['Bcc'] = bcc
 
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         create_message = {"raw": encoded_message}
         results = self.service.users().messages().send(userId='me', body=create_message).execute()
-        print(results)
+        return f"Email sent to {to} (id {results.get('id')})."
     
     def get_unread_emails(self, max_results: int = 10):
         """
@@ -446,87 +522,117 @@ class GmailAgent():
     
     def get_email_by_id(self, email_id: str):
         """
-        Fetch the full body of a specific email by its ID. 
+        Fetch the full body of a specific email by its ID.
         Always call this after get_unread_emails or search_emails when the user wants to read the actual content.
         """
-        detail = self.service.users().messages().get(
-                    userId="me", 
-                    id=email_id,
-                    format="metadata",
-                    metadataHeaders=["From", "Subject", "Date"]
-                ).execute()
-        return detail
-    
-    def get_all_labels(self):
-        results = self.service.users().labels().list(userId="me").execute()
-        labels = results.get('labels', [])
-        labels = labels[:-1]
-        return [label['name'] for label in labels]
-    
-    def reply_to_email(self,email_id:str = "", body:str = ""):
-        """
-        Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID. 
-        Use when user wants to respond to an email.
-        """
-        
         detail = self.service.users().messages().get(
             userId="me",
             id=email_id,
             format="full"
         ).execute()
-
         headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-        
-        # Extract and decode body
-        body = ""
-        payload = detail.get("payload", {})
-        
-        if "parts" in payload:
-            for part in payload["parts"]:
-                if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                    break
-                elif part["mimeType"] == "text/html" and "data" in part.get("body", {}):
-                    html = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                    body = BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
-        elif "data" in payload.get("body", {}):
-            raw = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
-            if payload.get("mimeType") == "text/html":
-                body = BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
-            else:
-                body = raw
-
         return {
             "id": email_id,
             "from": headers.get("From", ""),
             "subject": headers.get("Subject", ""),
             "date": headers.get("Date", ""),
-            "body": body[:3000]  # cap so it doesn't blow up context window
+            "body": self._extract_body(detail.get("payload", {}))[:3000],  # cap so it doesn't blow up context window
         }
-    
-    def mark_as_read(email_id:str):
+
+    def get_all_labels(self):
+        results = self.service.users().labels().list(userId="me").execute()
+        labels = results.get('labels', [])
+        labels = labels[:-1]
+        return [label['name'] for label in labels]
+
+    def reply_to_email(self, email_id: str = "", body: str = ""):
+        """
+        Reply to an existing email thread with the given body text. Call search_email or
+        get_unread_emails first to get the email ID. The reply is threaded correctly
+        (Re: subject, same conversation). Use when user wants to respond to an email.
+        """
+        detail = self.service.users().messages().get(
+            userId="me",
+            id=email_id,
+            format="metadata",
+            metadataHeaders=["From", "Subject", "Message-ID", "References"],
+        ).execute()
+        headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
+
+        subject = headers.get("Subject", "")
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+        original_msg_id = headers.get("Message-ID", "")
+
+        message = EmailMessage()
+        message.set_content(body)
+        message["To"] = headers.get("From", "")
+        message["Subject"] = subject
+        if original_msg_id:
+            message["In-Reply-To"] = original_msg_id
+            message["References"] = (headers.get("References", "") + " " + original_msg_id).strip()
+
+        encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        result = self.service.users().messages().send(
+            userId="me",
+            body={"raw": encoded, "threadId": detail.get("threadId")},
+        ).execute()
+        return f"Replied to {headers.get('From', 'the sender')} (id {result.get('id')})."
+
+    def mark_as_read(self, email_id: str):
         """
         Mark a specific email as read. Use when user asks to mark an email as read or after reading an email aloud.
         """
-        return
-    
-    def delete_email(email_id:str):
+        self.service.users().messages().modify(
+            userId="me", id=email_id, body={"removeLabelIds": ["UNREAD"]}
+        ).execute()
+        return "Marked as read."
+
+    def trash_email(self, email_id: str):
         """
         Move an email to trash. Use when user asks to delete, remove, or trash an email.
         """
-        return
-    
-    def get_drafts(max_results: int = 100):
+        self.service.users().messages().trash(userId="me", id=email_id).execute()
+        return "Moved to trash."
+
+    def untrash_email(self, email_id: str):
+        """
+        Restore an email from the trash. Use when user asks to undo a delete or recover an email.
+        """
+        self.service.users().messages().untrash(userId="me", id=email_id).execute()
+        return "Restored from trash."
+
+    def get_drafts(self, max_results: int = 10):
         """
         Fetch saved email drafts. Use when user asks about drafts or wants to send a previously saved draft.
         """
-        return
-    
-    def get_sent_emails(max_results: int = 100):
+        results = self.service.users().drafts().list(
+            userId="me", maxResults=max_results
+        ).execute()
+        drafts = results.get("drafts", [])
+        if not drafts:
+            return "No drafts."
+        out = []
+        for draft in drafts:
+            detail = self.service.users().drafts().get(
+                userId="me", id=draft["id"], format="metadata"
+            ).execute()
+            headers = {h["name"]: h["value"]
+                       for h in detail["message"]["payload"].get("headers", [])}
+            out.append({
+                "draft_id": draft["id"],
+                "to": headers.get("To", ""),
+                "subject": headers.get("Subject", ""),
+                "snippet": detail["message"].get("snippet", ""),
+            })
+        return out
+
+    def get_sent_emails(self, max_results: int = 10):
         """
         Fetch recently sent emails. Use when user asks what emails they've sent or wants to check sent history.
         """
-        return
+        emails = self._list_messages(label_ids=["SENT"], max_results=max_results)
+        return emails or "Nothing in sent mail."
     
     def get_sender_profile(self):
         """
