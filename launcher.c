@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 /*
  * Jarvis.app launcher.
  *
@@ -46,5 +47,15 @@ int main(void) {
     execlp("python3", "python3", "jarvis.py", (char *)NULL);
 
     perror("Jarvis launcher: failed to start Python backend");
+=======
+#include <unistd.h>
+int main(void) {
+    char *const args[] = {
+        "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+        "/Users/rino/jarvis_ai/jarvis.py",
+        (char *)0
+    };
+    execv(args[0], args);
+>>>>>>> e2df5b4184e17ec1b4de6e796cafd4e189e5428d
     return 1;
 }
