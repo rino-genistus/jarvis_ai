@@ -1,0 +1,21 @@
+# Jarvis — local-first voice assistant (Apple Silicon)
+python-dotenv
+numpy
+sounddevice
+SpeechRecognition
+mlx-whisper
+kokoro
+ollama
+pinecone
+spotipy
+tavily-python
+requests
+beautifulsoup4
+google-api-python-client
+google-auth-oauthlib
+PyQt6
+pyobjc
+watchdog            # file-index auto-refresh (FSEvents)
+rumps               # menu bar status icon
+pvporcupine         # optional: sub-100ms wake word (needs PICOVOICE_ACCESS_KEY)
+elevenlabs          # optional paid TTS/STT, off by default
