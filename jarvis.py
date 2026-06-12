@@ -3,7 +3,7 @@ from elevenlabs.client import ElevenLabs
 from elevenlabs.play import play
 import os
 import speech_recognition as sr
-import mlx_whisper 
+import mlx_whisper
 from ollama import chat, ChatResponse
 import time
 import tempfile
@@ -94,24 +94,24 @@ messages = [{"role": "system", "content": system_prompt}]
 """EXIT_PHRASES = [
     # Direct goodbyes
     "goodbye", "good bye", "bye", "bye bye", "farewell",
-    
+
     # Dismissals
     "that's all", "that is all", "that'll be all", "that will be all",
     "you're dismissed", "dismissed",
-    
+
     # Sleep/standby commands
     "go to sleep", "sleep mode", "stand by", "standby",
     "power down", "shut down", "shutdown",
-    
+
     # Session enders
     "we're done", "we are done", "i'm done", "i am done",
     "end session", "stop listening", "stop jarvis",
     "that's enough", "that is enough", "enough for now",
-    
+
     # Natural conversation closers
     "talk later", "talk to you later", "we'll talk later",
     "catch you later", "until next time",
-    
+
     # Explicit exits
     "exit", "quit", "close",
 ]"""
@@ -143,7 +143,7 @@ def play_audio_with_kokoro(text):
     chunks = []
     for i, (gs, ps, audio) in enumerate(generator):
         chunks.append(audio)
-    
+
     if chunks:
         full_audio = np.concatenate(chunks)
         sd.play(full_audio, samplerate=24000)
@@ -183,7 +183,7 @@ def record_audio_and_transcribe_elevenlabs():
             diarize=True,
         )
         return transcription.text
-    
+
 def record_audio_and_transcribe_mlx_whisper():
     """
     Current transcription method for user - free. Runs efficiently on Mac Silicone chip
@@ -205,7 +205,7 @@ def record_audio_and_transcribe_mlx_whisper():
             temp_path,
             path_or_hf_repo="mlx-community/whisper-small-mlx",
         )
-        
+
         os.remove(temp_path)
         print("User: ", result['text'].strip())
         return result["text"].strip()
@@ -219,10 +219,10 @@ def extract_important_messages(messages):
         messages=[
             {
                 "role": "user",
-                "content": f"""Review this conversation and extract only information worth remembering long-term about the user — preferences, facts, habits, goals, or anything personally relevant. 
+                "content": f"""Review this conversation and extract only information worth remembering long-term about the user — preferences, facts, habits, goals, or anything personally relevant.
                 Ignore greetings, small talk, and one-off questions like weather lookups.
                 Return a list of concise factual statements, one per line. If nothing is worth remembering, return 'NONE'.
-                
+
                 Conversation:
                 {messages}"""
             }
@@ -233,16 +233,16 @@ def extract_important_messages(messages):
         return []
     memories = [
         line.strip().lstrip("0123456789.-) ")
-        for line in results.split('\n') 
+        for line in results.split('\n')
         if line.strip()
     ]
-    
+
     records = [
         {"id": f"mem-{int(time.time())}-{i}", "chunk_text": memory}
         for i, memory in enumerate(memories)
         if memory
     ]
-    
+
     print(f"Storing {len(records)} memories: {[r['chunk_text'] for r in records]}")
     return records
 
@@ -265,7 +265,7 @@ def classify_intent(text):
     """Returns 'exit', 'tool', or 'chat'"""
     response = chat(
             model='llama3.2:1b',
-            messages=[{"role": "user", "content": 
+            messages=[{"role": "user", "content":
                     f"""Classify this message. Reply with exactly one word only: exit, tool, or chat.
 
             exit = user wants to end the conversation
@@ -273,7 +273,7 @@ def classify_intent(text):
             chat = general conversation or questions
 
             Message: "{text}"
-            
+
             One word answer:"""}]
     )
     result = response.message.content.strip().lower()
@@ -330,7 +330,7 @@ def main_loop():
         if memories:
             memory_block = "\n".join(f"- {m}" for m in memories)
             messages[0]["content"] = system_prompt + f"\n\n## What you know about the user:\n{memory_block}" #Adding meaningful memories to message history for LLM context
-        print(f"Intent: {intent}") 
+        print(f"Intent: {intent}")
         messages.append({"role": "user", "content": transcribed_text})
         if intent == 'exit':
             #User is leaving or conversation is done
@@ -350,18 +350,18 @@ def main_loop():
 
             current_date = datetime.now().strftime("%Y-%m-%d")
             dated_messages = messages[:-1] + [{
-                "role": "user", 
+                "role": "user",
                 "content": f"[Today's date is {current_date}] {messages[-1]['content']}"
             }]
             response: ChatResponse = chat(
                 model='qwen2.5:7b',
                 messages=dated_messages,
                 tools=[
-                    calendar.create_event, 
-                    calendar.get_calendar_events, 
-                    calendar.delete_calendar_event, 
-                    calendar.update_calendar_event, 
-                    websearch.search_web, 
+                    calendar.create_event,
+                    calendar.get_calendar_events,
+                    calendar.delete_calendar_event,
+                    calendar.update_calendar_event,
+                    websearch.search_web,
                     websearch.extract_webpages,
                     weather.get_current_weather,
                     weather.get_weather_with_time,

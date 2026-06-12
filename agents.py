@@ -108,17 +108,17 @@ class Calendar_Agents():
             calendarId=calendar_id,
             eventId=event_id
         ).execute()
-        
+
         # Merge your updates in
         event.update(updates)
-        
+
         # Send it back
         updated_event = self.service.events().update(
             calendarId=calendar_id,
             eventId=event_id,
             body=event
         ).execute()
-        
+
         return updated_event
 
 class WebSearchAgents():
@@ -127,21 +127,21 @@ class WebSearchAgents():
         self.tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
     def search_web(self, query: str):
         """
-        Search the web for current information, news, facts, or anything 
-        that requires up to date knowledge. Use this for weather, news, 
+        Search the web for current information, news, facts, or anything
+        that requires up to date knowledge. Use this for weather, news,
         prices, recent events, or any factual question.
         """
         response = self.tavily_client.search(
-            query = query, 
-            max_results = 5, 
-            include_answer = True, 
+            query = query,
+            max_results = 5,
+            include_answer = True,
             search_depth = 'advanced',
         )
         return response['answer']
     def extract_webpages(self, query: str):
         """
-        Use this when the user wants to read a full article, page, or document 
-        in detail — not just a quick answer. Searches for the best URL then 
+        Use this when the user wants to read a full article, page, or document
+        in detail — not just a quick answer. Searches for the best URL then
         extracts the full content.
         """
         # Step 1 — find the best URL for the query
@@ -169,8 +169,8 @@ class WeatherSearch():
     def get_current_weather(self, latitude: float, longitude: float, exclude: list[str]):
         """
         Get the current weather and forecast for a location using its coordinates.
-        Use this for any question about current conditions, temperature, humidity, 
-        wind, or upcoming forecast. Exclude options: 'current', 'minutely', 'hourly', 
+        Use this for any question about current conditions, temperature, humidity,
+        wind, or upcoming forecast. Exclude options: 'current', 'minutely', 'hourly',
         'daily', 'alerts'.
         """
         exclude_str = ",".join(exclude) if exclude else ""
@@ -179,7 +179,7 @@ class WeatherSearch():
     def get_weather_with_time(self, latitude: float, longitude: float, target_hour: str):
         """
         Get the hourly weather forecast for a specific hour today.
-        Use this when the user asks about weather at a specific time, 
+        Use this when the user asks about weather at a specific time,
         e.g. 'what will the weather be at 10pm tonight'.
         target_hour should be in 24-hour format (0-23) in the location's local time.
         """
@@ -199,7 +199,7 @@ class WeatherSearch():
     def get_daily_forecast(self, latitude: float, longitude: float, days: int = 7):
         """
         Get the daily weather forecast for the next N days (max 8).
-        Use this when the user asks about weather over multiple days, 
+        Use this when the user asks about weather over multiple days,
         a specific day this week, or a general weekly forecast.
         days should be between 1 and 8.
         """
@@ -209,11 +209,11 @@ class WeatherSearch():
 
         daily = data.get("daily", [])
         return daily[:days]
-    
+
     def get_weather_alerts(self, latitude: float, longitude: float,):
         """
         Get any active severe weather alerts for a location.
-        Use this when the user asks about weather warnings, storms, 
+        Use this when the user asks about weather warnings, storms,
         advisories, or any severe weather in their area.
         """
         response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&units=imperial&appid={os.getenv('OPENWEATHER_API_KEY')}")
@@ -225,7 +225,7 @@ class WeatherSearch():
             return alerts
 
 class SpotifyAgent():
-    
+
     def __init__(self):
         self.sp = None
         self._setup()
@@ -256,7 +256,7 @@ class SpotifyAgent():
             return "Spotify not Connected"
         results = self.sp.current_user_playing_track()
         return results
-    
+
     def search_song_and_queue(self, query: str = ''):
         """
         Search for a song on Spotify by name or artist and return its URI.
@@ -279,7 +279,7 @@ class SpotifyAgent():
             if "NO_ACTIVE_DEVICE" in str(e):
                 return f"Found '{track_name}' by {artist_name} but Spotify has no active device. Open Spotify and start playing something first."
             return f"Spotify error: {str(e)}"
-        
+
     def create_playlist(self, playlist_name: str, public: bool = True, collaborative: bool = True, description: str = ""):
         """
         Create a playlist with the playlist name provided, public boolean if provided, collaborative if provided and description if provided
@@ -296,7 +296,7 @@ class SpotifyAgent():
         )
         return {"name": playlist["name"], "id": playlist["id"], "url": playlist["external_urls"]["spotify"]}
 
-    
+
     def recently_played(self, limit: int = 25):
         """
         Returns the recently played songs
@@ -312,7 +312,7 @@ class SpotifyAgent():
             }
             for item in results['items']
         ]
-    
+
     def add_song_to_playlist(self, track_name: str, playlist_name: str, limit: int = 1000):
         """
         Adds song to playlist of user's choice. Retrieves song uri and playlist uri if playlist exists and then adds song to the playlist
@@ -336,7 +336,7 @@ class SpotifyAgent():
         track_uri = results['tracks']['items'][0]['uri']
         self.sp.playlist_add_items(playlist_id=playlist_uri, items=[track_uri])
         return f"Added {track_name} to {playlist_name}"
-    
+
     def skip_song(self):
         """
         Skips currently playing song
@@ -344,7 +344,7 @@ class SpotifyAgent():
         if not self.sp:
             return "Spotify is not connected"
         self.sp.next_track()
-    
+
     def pause_song(self):
         """
         Pauses currently playing song
@@ -370,17 +370,17 @@ class SpotifyAgent():
             return "Spotify is not connected"
         self.sp.volume(volume_percent=volume)
         return f"Playback volume set to {volume}"
-    
+
 class GmailAgent():
 
     def __init__(self):
         self.service = self._setup()
     def _setup(self):
         return build("gmail", "v1", credentials=get_google_creds())
-    
+
     def search_email(self, query:str = "", max_results:int = 10):
         """
-        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'. 
+        Search emails by any criteria. Supports Gmail search syntax like 'from:name@email.com', 'subject:invoice', 'is:unread', 'after:2026/04/01'.
         Use when user references an email by sender, topic, or keyword.
         """
         results = self.service.users().messages().list(q=query, userId='me', labelIds=['INBOX']).execute()
@@ -392,7 +392,7 @@ class GmailAgent():
             msg_content = self.service.users().messages().get(userId='me', id=msg['id']).execute()
             messages_dict.update({msg['id']: msg_content['snippet']})
         return messages_dict
-    
+
     def send_email(self, content: str, to: str = "", cc:str = "", bcc:str = "", subject: str = ""):
         '''
         Compose and send a new email. Use when user asks to send, write, or compose an email to someone.
@@ -408,31 +408,31 @@ class GmailAgent():
         create_message = {"raw": encoded_message}
         results = self.service.users().messages().send(userId='me', body=create_message).execute()
         print(results)
-    
+
     def get_unread_emails(self, max_results: int = 10):
         """
-        Fetch unread emails from inbox. Returns sender, subject, date, snippet, and ID for each. 
+        Fetch unread emails from inbox. Returns sender, subject, date, snippet, and ID for each.
         Use when user asks about new or unread emails.
         """
         results = self.service.users().messages().list(
-            userId="me", 
+            userId="me",
             labelIds=['UNREAD'],
             maxResults=max_results
         ).execute()
-        
+
         messages = results.get("messages", [])
         if not messages:
             return "No unread emails."
-        
+
         emails = []
         for msg in messages:
             detail = self.service.users().messages().get(
-                userId="me", 
+                userId="me",
                 id=msg["id"],
                 format="metadata",
                 metadataHeaders=["From", "Subject", "Date"]
             ).execute()
-            
+
             headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
             emails.append({
                 "id": msg["id"],
@@ -441,34 +441,34 @@ class GmailAgent():
                 "date": headers.get("Date", ""),
                 "snippet": detail.get("snippet", "")
             })
-        
+
         return emails
-    
+
     def get_email_by_id(self, email_id: str):
         """
-        Fetch the full body of a specific email by its ID. 
+        Fetch the full body of a specific email by its ID.
         Always call this after get_unread_emails or search_emails when the user wants to read the actual content.
         """
         detail = self.service.users().messages().get(
-                    userId="me", 
+                    userId="me",
                     id=email_id,
                     format="metadata",
                     metadataHeaders=["From", "Subject", "Date"]
                 ).execute()
         return detail
-    
+
     def get_all_labels(self):
         results = self.service.users().labels().list(userId="me").execute()
         labels = results.get('labels', [])
         labels = labels[:-1]
         return [label['name'] for label in labels]
-    
+
     def reply_to_email(self,email_id:str = "", body:str = ""):
         """
-        Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID. 
+        Reply to an existing email thread. Call search_emails or get_unread_emails first to get the email ID.
         Use when user wants to respond to an email.
         """
-        
+
         detail = self.service.users().messages().get(
             userId="me",
             id=email_id,
@@ -476,11 +476,11 @@ class GmailAgent():
         ).execute()
 
         headers = {h["name"]: h["value"] for h in detail["payload"]["headers"]}
-        
+
         # Extract and decode body
         body = ""
         payload = detail.get("payload", {})
-        
+
         if "parts" in payload:
             for part in payload["parts"]:
                 if part["mimeType"] == "text/plain" and "data" in part.get("body", {}):
@@ -503,34 +503,34 @@ class GmailAgent():
             "date": headers.get("Date", ""),
             "body": body[:3000]  # cap so it doesn't blow up context window
         }
-    
+
     def mark_as_read(email_id:str):
         """
         Mark a specific email as read. Use when user asks to mark an email as read or after reading an email aloud.
         """
         return
-    
+
     def delete_email(email_id:str):
         """
         Move an email to trash. Use when user asks to delete, remove, or trash an email.
         """
         return
-    
+
     def get_drafts(max_results: int = 100):
         """
         Fetch saved email drafts. Use when user asks about drafts or wants to send a previously saved draft.
         """
         return
-    
+
     def get_sent_emails(max_results: int = 100):
         """
         Fetch recently sent emails. Use when user asks what emails they've sent or wants to check sent history.
         """
         return
-    
+
     def get_sender_profile(self):
         """
-        Returns the email address of the currently authenticated Gmail account. 
+        Returns the email address of the currently authenticated Gmail account.
         Call this before sending if the user hasn't specified which account to use, so you can confirm with them.
         """
         results = self.service.users().getProfile(userId='me').execute()
