@@ -7,15 +7,26 @@ import mlx_whisper
 from ollama import chat, ChatResponse
 import time
 import tempfile
-from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent
-from datetime import datetime
+from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent, RemindersAgent
+from datetime import datetime, timedelta
 from kokoro import KPipeline
 import sounddevice as sd
 import numpy as np
 from pinecone import Pinecone
 import threading
+import inspect
+import queue
+import re
 
 start_time = time.time()
+
+# Keep Ollama models resident. The default 5 minute keep_alive means an idle
+# assistant pays a 4.4s reload for qwen and 2.3s for llama on the next command.
+OLLAMA_KEEP_ALIVE = -1
+
+# Cap spoken replies. Generation and playback both scale with length, and a
+# 73 token answer is already 7.6 seconds of speech.
+GEN_OPTIONS = {"num_predict": 160}
 
 load_dotenv()
 
@@ -55,6 +66,103 @@ websearch = WebSearchAgents()
 weather = WeatherSearch()
 spotify = SpotifyAgent()
 gmail = GmailAgent()
+reminders = RemindersAgent()
+
+AGENTS = [calendar, websearch, weather, spotify, gmail, reminders]
+
+def build_tool_registry(agents):
+    """
+    Collects every public method off every agent into one name -> method mapping.
+
+    Both the tools list handed to Ollama and the dispatch dict used to run the
+    calls are derived from this, so adding a method to an agent class is all it
+    takes to expose it — the two can no longer drift apart the way they used to.
+    """
+    registry = {}
+    for agent in agents:
+        for name in dir(agent):
+            if name.startswith("_"):
+                continue
+            method = getattr(agent, name)
+            # Bound methods only — skips clients and constants like self.sp or PRIORITY_MAP
+            if not inspect.ismethod(method):
+                continue
+            if name in registry:
+                raise ValueError(
+                    f"Two agents both define a tool called '{name}'. "
+                    "Tool names must be unique or the model will call one and get the other."
+                )
+            registry[name] = method
+    return registry
+
+TOOL_REGISTRY = build_tool_registry(AGENTS)
+print(f"{len(TOOL_REGISTRY)} tools registered across {len(AGENTS)} agents")
+
+
+# --- Tool routing -----------------------------------------------------------
+# Sending all 45 schemas costs 3,649 prompt tokens and ~13.5s of prompt eval on
+# every command. Worse, at that size qwen2.5:7b starts ignoring the tools and
+# inventing answers instead. Routing to one agent's tools cuts the payload to
+# roughly 1,000 tokens and restores correct tool selection.
+
+GROUP_BY_CLASS = {
+    "WeatherSearch": "weather",
+    "Calendar_Agents": "calendar",
+    "SpotifyAgent": "music",
+    "GmailAgent": "email",
+    "RemindersAgent": "reminders",
+    "WebSearchAgents": "web",
+}
+
+def build_tool_groups(agents):
+    """
+    Buckets the registry by the agent that owns each method.
+
+    Derived from AGENTS rather than hand-listed, so a new method joins its
+    group automatically — the same no-drift property build_tool_registry gives.
+    """
+    groups = {}
+    for agent in agents:
+        group = GROUP_BY_CLASS.get(type(agent).__name__)
+        if group is None:
+            raise ValueError(f"{type(agent).__name__} has no entry in GROUP_BY_CLASS")
+        for name in dir(agent):
+            if name.startswith("_"):
+                continue
+            method = getattr(agent, name)
+            if inspect.ismethod(method):
+                groups.setdefault(group, []).append(method)
+    return groups
+
+TOOL_GROUPS = build_tool_groups(AGENTS)
+ALL_TOOLS = list(TOOL_REGISTRY.values())
+
+# Checked before the classifier runs. A hit skips the LLM entirely, which is
+# both faster and more reliable than asking a 1B model.
+GROUP_KEYWORDS = {
+    "weather": ("weather", "forecast", "temperature", "raining", "rain", "snow",
+                "sunny", "humid", "wind", "how hot", "how cold", "degrees"),
+    "reminders": ("remind", "reminder", "task list", "to-do", "todo", "don't let me forget"),
+    "calendar": ("calendar", "schedule", "meeting", "appointment", "event", "am i free",
+                 "what's on", "whats on", "book me"),
+    "music": ("play ", "spotify", "song", "track", "album", "artist", "playlist",
+              "skip", "pause the", "volume", "shuffle", "what's playing", "whats playing"),
+    "email": ("email", "inbox", "gmail", "unread", "reply to", "send a mail", "draft"),
+    "web": ("search the web", "look up", "google", "search for", "find online",
+            "latest news", "research"),
+}
+
+def route_tools(text):
+    """
+    Picks the tool group for a command. Returns (group_name, tools) or (None, None)
+    to mean 'no confident route, send everything'.
+    """
+    lowered = text.lower()
+    for group, words in GROUP_KEYWORDS.items():
+        if any(word in lowered for word in words):
+            return group, TOOL_GROUPS[group]
+    return None, None
+
 
 system_prompt = f"""
     You are JARVIS (Just A Rather Very Intelligent System), an advanced AI assistant built to serve as a highly capable, loyal, and intelligent personal assistant.
@@ -122,33 +230,119 @@ candidate_labels = ["end_conversation", "continue_conversation"]
 
 r = sr.Recognizer()
 
-def play_chime():
+CHIME = object()          # queue marker: play the "your turn" tone
+_SPEAK_Q = queue.Queue()  # everything Jarvis says goes through here, in order
+
+
+def _chime_samples():
     """
-    Function that Plays a Small Chime sound so that User knows when Jarvis is done talking
+    Small tone so the user knows when Jarvis has finished talking.
     """
     sample_rate = 24000
     duration = 0.15
     freq = 880
     t = np.linspace(0, duration, int(sample_rate * duration))
-    tone = (np.sin(2 * np.pi * freq * t) * 0.3).astype(np.float32)
-    sd.play(tone, samplerate=sample_rate)
-    sd.wait()
+    return (np.sin(2 * np.pi * freq * t) * 0.3).astype(np.float32)
 
-def play_audio_with_kokoro(text):
+
+def _speaker_worker():
     """
-    Kokoro model that plays the text returned by the LLM
+    Single audio thread. Owns one persistent output stream and drains the speak
+    queue forever.
+
+    Two reasons this is a thread rather than an inline call. It lets the main
+    loop keep working while Jarvis is still talking — the acknowledgement plays
+    over the top of the model call instead of delaying it. And because every
+    utterance is queued, ordering is preserved without any locking.
     """
     kokoro_ready.wait()
-    generator = kokoro_pipeline(text, voice='af_heart')
-    chunks = []
-    for i, (gs, ps, audio) in enumerate(generator):
-        chunks.append(audio)
+    stream = sd.OutputStream(samplerate=24000, channels=1, dtype='float32')
+    stream.start()
+    while True:
+        item = _SPEAK_Q.get()
+        try:
+            if item is CHIME:
+                stream.write(_chime_samples())
+            elif isinstance(item, threading.Event):
+                item.set()          # flush marker: everything before this has played
+            elif item:
+                # stream.write blocks while the buffer is full, so synthesis of
+                # the next chunk overlaps playback of the current one. Kokoro
+                # runs at RTF 0.18, so it always stays ahead.
+                for _, _, audio in kokoro_pipeline(item, voice='af_heart'):
+                    stream.write(np.asarray(audio, dtype=np.float32))
+        except Exception as e:
+            print(f"TTS error: {e}")
+        finally:
+            _SPEAK_Q.task_done()
 
-    if chunks:
-        full_audio = np.concatenate(chunks)
-        sd.play(full_audio, samplerate=24000)
-        sd.wait()
-    play_chime() #Chimes right before the User can talk. Make it sound a bit better later
+
+threading.Thread(target=_speaker_worker, daemon=True).start()
+
+
+def say(text):
+    """
+    Queue text to be spoken. Returns immediately — it does not wait for playback.
+    """
+    if text and text.strip():
+        _SPEAK_Q.put(text.strip())
+
+
+def chime():
+    _SPEAK_Q.put(CHIME)
+
+
+def wait_until_spoken():
+    """
+    Block until everything queued so far has actually finished playing.
+
+    Used just before recording, so Jarvis never listens to himself.
+    """
+    marker = threading.Event()
+    _SPEAK_Q.put(marker)
+    marker.wait()
+
+
+# Split only on punctuation followed by whitespace. Matching at end-of-buffer
+# too would flush "72." out of a half-streamed "72.4" and mangle the number.
+SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
+
+
+def speak_stream(stream_response):
+    """
+    Consume a streaming Ollama response and hand each finished sentence to the
+    speaker as soon as it appears.
+
+    Jarvis starts talking after the first sentence rather than after the last
+    token, which is most of the perceived latency on a long answer.
+
+    Returns the full text so it can still be appended to the message history.
+    """
+    buffer = ""
+    spoken_any = False
+    full = []
+    for part in stream_response:
+        piece = part.message.content or ""
+        if not piece:
+            continue
+        full.append(piece)
+        buffer += piece
+        # Only flush on a sentence boundary — Kokoro's prosody falls apart if
+        # it is fed half a clause at a time.
+        while True:
+            match = SENTENCE_END.search(buffer)
+            if not match or match.end() == 0:
+                break
+            sentence, buffer = buffer[:match.end()].strip(), buffer[match.end():]
+            if sentence:
+                say(sentence)
+                spoken_any = True
+    if buffer.strip():
+        say(buffer)
+        spoken_any = True
+    if not spoken_any:
+        print("Warning: empty response, nothing to speak")
+    return "".join(full).strip()
 
 def play_audio_with_text_eleven_labs(text):
     """
@@ -190,7 +384,7 @@ def record_audio_and_transcribe_mlx_whisper():
     """
     with sr.Microphone() as source:
         r.energy_threshold = 200
-        r.pause_threshold = 1.5
+        r.pause_threshold = 0.8  # was 1.5 — that much dead air is felt directly as latency
         r.phrase_threshold = 0.1
         r.non_speaking_duration = 0.8
         print("User Talks Now")
@@ -216,6 +410,7 @@ def extract_important_messages(messages):
     """
     response = chat(
         model='qwen2.5:7b',
+        keep_alive=OLLAMA_KEEP_ALIVE,
         messages=[
             {
                 "role": "user",
@@ -260,11 +455,12 @@ def retrieve_memories(query: str, top_k: int = 5):
 
 def classify_intent(text):
     """
-    classifies intent for LLM to know how to proceed with conversation
+    Returns 'exit', 'tool', or 'chat'.
     """
-    """Returns 'exit', 'tool', or 'chat'"""
     response = chat(
             model='llama3.2:1b',
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            options={"num_predict": 4},
             messages=[{"role": "user", "content":
                     f"""Classify this message. Reply with exactly one word only: exit, tool, or chat.
 
@@ -282,17 +478,87 @@ def classify_intent(text):
         return "chat"
     return first_word
 
-def safe_speak(text):
+
+def classify_tool_group(text):
     """
-    Makes sure that something is returned from tool calls so that TTS doesnt play empty sound files
+    Second-stage router, only reached when no keyword matched.
+
+    Asks the 1B model which subsystem the command belongs to. A wrong answer is
+    survivable — the tool call retries with the full registry if the routed
+    group produces nothing — so speed matters more than precision here.
     """
     try:
-        if not text or not text.strip():
-            print("Warning: empty response, skipping TTS")
-            return
-        play_audio_with_kokoro(text)
-    except KeyboardInterrupt:
-        pass
+        response = chat(
+            model='llama3.2:1b',
+            keep_alive=OLLAMA_KEEP_ALIVE,
+            options={"num_predict": 4},
+            messages=[{"role": "user", "content":
+                    f"""Which system handles this request? Reply with exactly one word.
+
+            weather = forecasts, temperature, conditions
+            calendar = events, meetings, schedule
+            reminders = reminders, tasks, to-do items
+            music = Spotify, songs, playback, volume
+            email = Gmail, inbox, messages
+            web = searching the internet for information
+
+            Request: "{text}"
+
+            One word answer:"""}]
+        )
+        guess = response.message.content.strip().lower().split()[0].strip(".,")
+        if guess in TOOL_GROUPS:
+            return guess
+    except Exception as e:
+        print(f"Group classifier failed: {e}")
+    return None
+
+def safe_speak(text):
+    """
+    Queue text for playback, guarding against the empty strings that tool
+    summaries occasionally produce.
+    """
+    if not text or not text.strip():
+        print("Warning: empty response, skipping TTS")
+        return
+    say(text)
+
+
+def prewarm():
+    """
+    Load both Ollama models and Whisper during startup instead of on the user's
+    first command, which otherwise costs 4.4s + 2.3s + the Whisper load.
+    """
+    try:
+        for model in ("qwen2.5:7b", "llama3.2:1b"):
+            chat(model=model, keep_alive=OLLAMA_KEEP_ALIVE,
+                 options={"num_predict": 1},
+                 messages=[{"role": "user", "content": "hi"}])
+        import soundfile as sf
+        silence = np.zeros(16000, dtype=np.float32)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        sf.write(path, silence, 16000)
+        mlx_whisper.transcribe(path, path_or_hf_repo="mlx-community/whisper-small-mlx")
+        os.remove(path)
+        print("Models prewarmed")
+    except Exception as e:
+        print(f"Prewarm skipped: {e}")
+
+
+def select_tools(text):
+    """
+    Chooses which schemas to send. Keyword rules first, then the 1B classifier,
+    then everything as a last resort.
+    """
+    group, tools = route_tools(text)
+    if tools is None:
+        group = classify_tool_group(text)
+        tools = TOOL_GROUPS[group] if group else None
+    if tools is None:
+        return "ALL", ALL_TOOLS
+    return group, tools
+
 
 def main_loop():
     """
@@ -302,42 +568,55 @@ def main_loop():
         print("Calibrating microphone...")
         r.adjust_for_ambient_noise(source, duration=0.3)
         r.dynamic_energy_threshold = False
-    #List of available tools for LLM
-    available_functions = {
-        'create_event': calendar.create_event,
-        'get_calendar_events': calendar.get_calendar_events,
-        'update_calendar_event': calendar.update_calendar_event,
-        'delete_calendar_event': calendar.delete_calendar_event,
-        'search_web': websearch.search_web,
-        'extract_webpages': websearch.extract_webpages,
-        'get_current_weather': weather.get_current_weather,
-        'get_weather_with_time': weather.get_weather_with_time,
-        'get_current_track': spotify.get_current_track,
-        'search_song_and_queue': spotify.search_song_and_queue,
-        'add_song_to_playlist': spotify.add_song_to_playlist,
-        'create_playlist': spotify.create_playlist,
-        'recently_played': spotify.recently_played,
-        'skip_song': spotify.skip_song,
-        'pause_song': spotify.pause_song,
-        'shuffle': spotify.shuffle,
-        'set_volume': spotify.set_volume,
-    }
+    # Dispatch table and tool schemas both come from the shared registry
+    available_functions = TOOL_REGISTRY
+
     while True:
         spoken = ""
+        # Never start recording while Jarvis is still talking, or the mic picks
+        # him up. Playback is asynchronous now, so this has to be explicit.
+        wait_until_spoken()
+
         transcribed_text = record_audio_and_transcribe_mlx_whisper() #User Text
-        intent = classify_intent(transcribed_text) #Intent for LLM
-        memories = retrieve_memories(transcribed_text) #List of meaningful memories from previous conversations
+        turn_start = time.time()
+
+        # Intent and memory both depend only on the transcript and nothing else,
+        # so run them together. Pinecone is a network call that has hit 1.6s.
+        parallel = {}
+        def _classify():
+            parallel["intent"] = classify_intent(transcribed_text)
+        def _recall():
+            try:
+                parallel["memories"] = retrieve_memories(transcribed_text)
+            except Exception as e:
+                print(f"Memory retrieval failed: {e}")
+                parallel["memories"] = []
+        threads = [threading.Thread(target=_classify), threading.Thread(target=_recall)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        intent = parallel.get("intent", "chat")
+        memories = parallel.get("memories", [])
+        print(f"Intent: {intent}  (routing took {time.time() - turn_start:.2f}s)")
+
+        user_content = transcribed_text
         if memories:
             memory_block = "\n".join(f"- {m}" for m in memories)
-            messages[0]["content"] = system_prompt + f"\n\n## What you know about the user:\n{memory_block}" #Adding meaningful memories to message history for LLM context
-        print(f"Intent: {intent}")
-        messages.append({"role": "user", "content": transcribed_text})
+            # Memories ride on the user message, never messages[0]. Rewriting the
+            # system prompt changed the first tokens of the prompt and threw away
+            # Ollama's prefix cache every single turn — a measured 13.8s penalty.
+            user_content = f"[What you know about the user:\n{memory_block}]\n\n{transcribed_text}"
+
+        messages.append({"role": "user", "content": user_content})
+
         if intent == 'exit':
             #User is leaving or conversation is done
-            completion = chat(model="qwen2.5:7b", messages=messages)
-            spoken = completion.message.content or ""
+            completion = chat(model="qwen2.5:7b", messages=messages, stream=True,
+                              keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
+            spoken = speak_stream(completion)
             messages.append({"role": "assistant", "content": spoken})
-            safe_speak(spoken)
+            chime()
+            wait_until_spoken()
             mems_list = extract_important_messages(messages=messages) #Gets meaningful messages from conversation
             if mems_list:
                 #Uploading meaningful memories to pinecone
@@ -346,77 +625,111 @@ def main_loop():
 
         elif intent == 'tool':
             #Needs tool usage
-            safe_speak("Right away sir.")
+            # Queued, not blocking — this plays over the model call instead of
+            # delaying it by the 2.2s it takes to speak.
+            say("Right away sir.")
 
-            current_date = datetime.now().strftime("%Y-%m-%d")
+            group, tools = select_tools(transcribed_text)
+            print(f"Tool group: {group} ({len(tools)} tools)")
+
+            # Spell out the coming week by name. Given only an ISO date, qwen2.5:7b
+            # works out weekdays wrong, so "remind me Friday" lands on the wrong day.
+            now = datetime.now()
+            upcoming = ", ".join(
+                (now + timedelta(days=offset)).strftime("%A %Y-%m-%d")
+                for offset in range(8)
+            )
+            date_context = (
+                f"[Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}. "
+                f"Dates this coming week: {upcoming}. "
+                f"Use these exact dates for any day the user names.]"
+            )
             dated_messages = messages[:-1] + [{
                 "role": "user",
-                "content": f"[Today's date is {current_date}] {messages[-1]['content']}"
+                "content": f"{date_context} {messages[-1]['content']}"
             }]
+            llm_start = time.time()
             response: ChatResponse = chat(
                 model='qwen2.5:7b',
                 messages=dated_messages,
-                tools=[
-                    calendar.create_event,
-                    calendar.get_calendar_events,
-                    calendar.delete_calendar_event,
-                    calendar.update_calendar_event,
-                    websearch.search_web,
-                    websearch.extract_webpages,
-                    weather.get_current_weather,
-                    weather.get_weather_with_time,
-                    spotify.get_current_track,
-                    spotify.search_song_and_queue,
-                    spotify.skip_song,
-                    spotify.pause_song,
-                    spotify.shuffle,
-                    spotify.set_volume,
-                ],
+                tools=tools,
+                keep_alive=OLLAMA_KEEP_ALIVE,
             )
+
+            # A misrouted group means the right tool was never offered. Retry once
+            # with everything rather than answering wrongly — this costs the old
+            # latency in the rare miss instead of paying it on every command.
+            if not response.message.tool_calls and tools is not ALL_TOOLS:
+                print(f"No tool call from group '{group}' — retrying with all {len(ALL_TOOLS)} tools")
+                tools = ALL_TOOLS
+                response: ChatResponse = chat(
+                    model='qwen2.5:7b',
+                    messages=dated_messages,
+                    tools=tools,
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+            print(f"Tool selection took {time.time() - llm_start:.2f}s")
+
             messages.append({"role": "assistant", "content": response.message.content or ""})
 
             if response.message.tool_calls: #Loops through all required tool calls to finish task
                 for tool_call in response.message.tool_calls:
                     if tool_call.function.name in available_functions:
                         print(f"Calling {tool_call.function.name} with {tool_call.function.arguments}")
-                        result = available_functions[tool_call.function.name](**tool_call.function.arguments) #Calls tool calls to complete task
+                        try:
+                            result = available_functions[tool_call.function.name](**tool_call.function.arguments) #Calls tool calls to complete task
+                        except Exception as e:
+                            # Hand the failure back to the model as text so it can
+                            # explain itself instead of crashing the session.
+                            result = f"That tool failed: {e}"
                         print(f"Tool result: {result}")
                         messages.append({"role": "tool", "tool_name": tool_call.function.name, "content": str(result)})
 
                 messages.append({
                     "role": "user",
-                    "content": "Summarize the tool results naturally in Jarvis's voice. Deliver the key points concisely, then offer one natural follow-up — like whether they want more detail on anything specific or if they want any action taken on the information given."
+                    "content": "Summarize the tool results naturally in Jarvis's voice. Two sentences at most. Do not call any more tools."
                 }) #Summarizes what was just done
 
-                follow_up: ChatResponse = chat(model='qwen2.5:7b', messages=messages)
-                spoken = follow_up.message.content or ""
+                # Same tools list as the call above on purpose. Ollama keeps one
+                # KV cache slot per model, so a summarisation request with a
+                # different prefix evicted the tool prefix and forced a full
+                # reprocess on the next command — measured 41ms vs 13,524ms.
+                follow_up = chat(model='qwen2.5:7b', messages=messages, tools=tools,
+                                 stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+                                 options=GEN_OPTIONS)
+                spoken = speak_stream(follow_up)
                 messages.append({"role": "assistant", "content": spoken})
             else:
                 spoken = response.message.content or response.message.thinking or ""
+                safe_speak(spoken)
 
         else:  # chat
-            response: ChatResponse = chat(model='qwen2.5:7b', messages=messages)
-            spoken = response.message.content or ""
+            response = chat(model='qwen2.5:7b', messages=messages, stream=True,
+                            keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
+            spoken = speak_stream(response)
             messages.append({"role": "assistant", "content": spoken})
 
         print("Jarvis:", spoken)
-        safe_speak(spoken)
-        #time.sleep(0.5)
+        print(f"Turn latency (transcript -> speech queued): {time.time() - turn_start:.2f}s")
+        chime()
 
 
 """def contains_exit_phrase(transcribed_text):
     return any(phrase in transcribed_text for phrase in EXIT_PHRASES)"""
 
-kokoro_ready.wait()
-#main_loop()
-print(f"First Command: {time.time() - start_time:.2f}s")
-#spotify.shuffle(False)
-emails = gmail.get_unread_emails()
-for email in emails:
-    print(email.get("id"))
-#print(gmail.get_all_labels())
-#print(gmail.get_email_by_id('19db13ec2dccb18a'))
-#print(gmail.send_email("Hello, Test email", "rr1406@scarletmail.rutgers.edu", 'rgenistus@gmail.com'))
-print(gmail.get_sender_profile())
-#print(gmail.search_email(query="from: rinogenistus@gmail.com"))
-print(gmail.reply_to_email(email_id="19dbca5b6b521fab"))
+def startup():
+    """
+    Blocks until Kokoro and both Ollama models are ready.
+    """
+    # Prewarm runs while Kokoro is still loading, so the model loads are free.
+    prewarm_thread = threading.Thread(target=prewarm, daemon=True)
+    prewarm_thread.start()
+    kokoro_ready.wait()
+    prewarm_thread.join()
+    print(f"Startup complete in {time.time() - start_time:.2f}s")
+
+
+# Guarded so tests.py can import this module without launching the assistant.
+if __name__ == "__main__":
+    startup()
+    main_loop()
