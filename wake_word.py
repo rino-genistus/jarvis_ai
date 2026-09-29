@@ -63,6 +63,37 @@ def _session(filename):
                                 providers=["CPUExecutionProvider"])
 
 
+_vad_session = None
+
+
+def speech_seconds(samples, threshold=0.5):
+    """
+    How many seconds of an utterance Silero VAD hears as speech. Takes 16 kHz
+    audio, float32 in [-1, 1] or int16.
+
+    The engine checks every recording with this before transcribing. In a
+    room with fan or traffic noise the energy threshold still lets bursts
+    through, and Whisper turns them into confident nonsense ("When my plane
+    gets here") that Jarvis would otherwise answer.
+    """
+    global _vad_session
+    if _vad_session is None:
+        ensure_models()
+        _vad_session = _session("silero_vad.onnx")
+    audio = np.asarray(samples)
+    if audio.dtype != np.int16:
+        audio = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+    h = np.zeros((2, 1, 64), dtype=np.float32)
+    c = np.zeros((2, 1, 64), dtype=np.float32)
+    speech_chunks = 0
+    for i in range(0, len(audio) - VAD_CHUNK + 1, VAD_CHUNK):
+        chunk = (audio[i:i + VAD_CHUNK] / 32767).astype(np.float32)
+        out, h, c = _vad_session.run(None, {"input": chunk[None], "h": h, "c": c,
+                                            "sr": np.array(16000, dtype=np.int64)})
+        speech_chunks += out[0][0] >= threshold
+    return speech_chunks * VAD_CHUNK / 16000
+
+
 class WakeWordDetector:
 
     def __init__(self, vad_threshold=0.5):

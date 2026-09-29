@@ -1,7 +1,9 @@
 #!/bin/bash
-# Builds Jarvis.app and installs it into Applications, so Jarvis has an icon in
-# Launchpad, Spotlight and Finder. Opening it starts the wake listener in the
-# background — no Dock icon, no window. Say "Hey Jarvis".
+# Builds two apps and installs them into Applications, so they show up in
+# Launchpad, Spotlight and Finder:
+#   Jarvis.app         starts the wake listener in the background — no Dock icon,
+#                      no window. Say "Hey Jarvis".
+#   Jarvis Status.app  shows whether Jarvis is working, with Restart and Open Log.
 #
 #   bash build_app.sh
 #
@@ -60,7 +62,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSMicrophoneUsageDescription</key>
     <string>Jarvis listens for "Hey Jarvis" and for your commands.</string>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Jarvis manages your reminders in the Reminders app.</string>
+    <string>Jarvis manages your reminders and looks things up in Contacts and Notes.</string>
+    <!-- Without these macOS refuses calendar access silently instead of asking -->
+    <key>NSCalendarsUsageDescription</key>
+    <string>Jarvis reads your calendars to answer questions about your schedule.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Jarvis reads your calendars to answer questions about your schedule.</string>
+    <key>NSContactsUsageDescription</key>
+    <string>Jarvis looks up people's details when you ask.</string>
 </dict>
 </plist>
 PLIST
@@ -84,14 +93,54 @@ chmod +x "$APP/Contents/MacOS/Jarvis"
 # permission to, so it isn't asked for again after every rebuild.
 codesign --force --sign - "$APP" >/dev/null
 
+# --- Status app -------------------------------------------------------------
+# A second click on Jarvis.app can't report anything — macOS just brings the
+# running app forward without starting it again — so status is its own app.
+STATUS_APP="$BUILD_DIR/Jarvis Status.app"
+echo "Building Jarvis Status.app..."
+rm -rf "$STATUS_APP"
+mkdir -p "$STATUS_APP/Contents/MacOS" "$STATUS_APP/Contents/Resources"
+cp "$PROJECT/assets/Jarvis.icns" "$STATUS_APP/Contents/Resources/Jarvis.icns"
+cat > "$STATUS_APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>                 <string>Jarvis Status</string>
+    <key>CFBundleDisplayName</key>          <string>Jarvis Status</string>
+    <key>CFBundleIdentifier</key>           <string>com.jarvisai.status</string>
+    <key>CFBundleExecutable</key>           <string>JarvisStatus</string>
+    <key>CFBundleIconFile</key>             <string>Jarvis</string>
+    <key>CFBundlePackageType</key>          <string>APPL</string>
+    <key>CFBundleShortVersionString</key>   <string>0.2</string>
+    <key>CFBundleVersion</key>              <string>2</string>
+    <key>LSMinimumSystemVersion</key>       <string>13.0</string>
+    <key>LSUIElement</key>                  <true/>
+</dict>
+</plist>
+PLIST
+cat > "$STATUS_APP/Contents/MacOS/JarvisStatus" <<LAUNCHER
+#!/bin/bash
+# Started by macOS when the Jarvis Status icon is opened.
+cd "$PROJECT" || exit 1
+exec "$PYTHON" status.py --dialog
+LAUNCHER
+chmod +x "$STATUS_APP/Contents/MacOS/JarvisStatus"
+codesign --force --sign - "$STATUS_APP" >/dev/null
+
 # --- Install ----------------------------------------------------------------
 if [[ -w /Applications ]]; then DEST="/Applications"; else DEST="$HOME/Applications"; mkdir -p "$DEST"; fi
-rm -rf "$DEST/Jarvis.app"
-cp -R "$APP" "$DEST/"
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST/Jarvis.app"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+for bundle in "$APP" "$STATUS_APP"; do
+    name="$(basename "$bundle")"
+    rm -rf "$DEST/$name"
+    cp -R "$bundle" "$DEST/"
+    "$LSREGISTER" -f "$DEST/$name"
+done
 
 echo ""
-echo "Installed $DEST/Jarvis.app"
-echo "  Start:  open it from Launchpad or Spotlight, then say \"Hey Jarvis\""
-echo "  Logs:   tail -f $PROJECT/logs/jarvis.log"
-echo "  Stop:   pkill -f wake_listener.py"
+echo "Installed $DEST/Jarvis.app and $DEST/Jarvis Status.app"
+echo "  Start:   open Jarvis from Launchpad or Spotlight, then say \"Hey Jarvis\""
+echo "  Check:   open Jarvis Status (or run: .venv/bin/python status.py)"
+echo "  Logs:    tail -f $PROJECT/logs/jarvis.log"
+echo "  Stop:    pkill -f wake_listener.py"

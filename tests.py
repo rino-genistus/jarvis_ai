@@ -95,12 +95,9 @@ def suite_imports():
             skip(f"{name} started", why)
         else:
             check(f"{name} started", False, why)
-    check("at least one agent running", len(j.AGENTS) > 0, f"{len(j.AGENTS)} of 6 agents")
-    import os
-    if os.getenv("PINECONE_API_KEY"):
-        check("Pinecone index reachable", j.dense_index is not None)
-    else:
-        skip("Pinecone index reachable", "PINECONE_API_KEY not set")
+    check("at least one agent running", len(j.AGENTS) > 0, f"{len(j.AGENTS)} of {len(j.AGENT_REQUIREMENTS)} agents")
+    check("on-device memory store open", j.memory is not None,
+          f"{j.memory.count()} memories" if j.memory is not None else "recall falls back to Obsidian search")
     check("assistant did not auto-run", True, "module is importable")
     return True
 
@@ -132,13 +129,19 @@ def suite_registry():
           "; ".join(failed[:3]) if failed else f"{len(reg)} schemas")
     check("no tool leaks a 'self' parameter", not leaked, ", ".join(leaked))
 
-    # Grouping must be a partition of the registry, or routing silently hides tools.
+    # Every tool must be in a group, or routing silently hides it. Only tools
+    # tool_catalog deliberately lists under a second agent may be in two.
     grouped = [m for tools in j.TOOL_GROUPS.values() for m in tools]
     names_in_groups = {m.__name__ for m in grouped}
     missing = set(reg) - names_in_groups
     check("every registered tool belongs to a group", not missing,
           f"missing: {sorted(missing)}" if missing else f"{len(j.TOOL_GROUPS)} groups")
-    check("no tool appears in two groups", len(grouped) == len(names_in_groups))
+    import tool_catalog
+    listed = [n for tools in tool_catalog.AGENT_TOOLS.values() for n in tools]
+    shared = {n for n in listed if listed.count(n) > 1}
+    doubled = {m.__name__ for m in grouped if [g.__name__ for g in grouped].count(m.__name__) > 1}
+    check("only deliberately shared tools appear in two groups", doubled <= shared,
+          f"unexpected: {sorted(doubled - shared)}" if doubled - shared else f"shared: {sorted(shared)}")
     check("ALL_TOOLS matches the registry", len(j.ALL_TOOLS) == len(reg))
 
     for group, tools in sorted(j.TOOL_GROUPS.items()):
@@ -197,6 +200,34 @@ def suite_routing():
     check("select_tools routes a clear request narrowly",
           tools is not j.ALL_TOOLS and len(tools) < 10,
           f"group={group}, {len(tools)} tools")
+
+    # Within an agent, only the tools the words call for — and the right one
+    # leads, because it picks the acknowledgement.
+    import tool_catalog
+    picks = [
+        ("GmailAgent", "do I have any unread emails", "get_unread_emails"),
+        ("GmailAgent", "reply to John's email saying sounds good", "reply_to_email"),
+        ("Calendar_Agents", "what's on my calendar tomorrow", "get_calendar_events"),
+        ("Calendar_Agents", "cancel my 3pm meeting", "delete_calendar_event"),
+        ("Calendar_Agents", "move my dentist appointment to Thursday", "update_calendar_event"),
+        ("RemindersAgent", "remind me to call mom on Friday", "add_reminder"),
+        ("RemindersAgent", "mark the milk reminder as done", "complete_reminder"),
+        ("WeatherSearch", "will it rain tonight", "get_weather_with_time"),
+        ("SpotifyAgent", "skip this track", "skip_song"),
+        ("EverydayToolsAgent", "how many days until Christmas", "days_between"),
+    ]
+    wrong = [(t, tool_catalog.pick(a, t)) for a, t, lead in picks if tool_catalog.pick(a, t)[0] != lead]
+    check("the best-matching tool leads each pick", not wrong,
+          f"{wrong}" if wrong else f"{len(picks)} requests")
+    sizes = [len(tool_catalog.pick(a, t)) for a, t, _ in picks]
+    check(f"picks stay within {tool_catalog.MAX_PICKED} tools", max(sizes) <= tool_catalog.MAX_PICKED,
+          f"largest {max(sizes)}")
+    needy = tool_catalog.pick("Calendar_Agents", "cancel my 3pm meeting")
+    check("a tool that needs an id comes with the tool that finds it",
+          "get_calendar_events" in needy, str(needy))
+    missing_ack = [f"{a}.{n}" for a, tools in tool_catalog.AGENT_TOOLS.items()
+                   for n, tool in tools.items() if not tool.ack]
+    check("every tool has an acknowledgement", not missing_ack, ", ".join(missing_ack))
 
 
 def suite_text():
@@ -313,11 +344,8 @@ def suite_cache():
     if "weather" not in j.TOOL_GROUPS:
         skip("prefix cache checks", "built around the weather tools, which are off")
         return
-    tools = j.TOOL_GROUPS["weather"]
-    base = [
-        {"role": "system", "content": j.system_prompt},
-        {"role": "user", "content": "[Today is Thursday.] what's the weather in Boston right now"},
-    ]
+    group, tools = j.select_tools("what's the weather in Boston right now")
+    base = j.tool_messages("what's the weather in Boston right now", [])
 
     def tool_call():
         return chat(model="qwen2.5:7b", messages=base, tools=tools,
@@ -331,7 +359,8 @@ def suite_cache():
 
     # Now the real test: a summarisation call in between, exactly as handle_turn does.
     summary_messages = base + [
-        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "get_current_weather", "arguments": {"location": "Boston"}}}]},
         {"role": "tool", "tool_name": "get_current_weather",
          "content": "{'temp': 72.4, 'humidity': 58, 'description': 'clear sky'}"},
         {"role": "user", "content": "Summarize the tool results naturally in Jarvis's voice. "
@@ -360,10 +389,6 @@ def suite_tools():
     from datetime import datetime, timedelta
 
     now = datetime.now()
-    upcoming = ", ".join((now + timedelta(days=o)).strftime("%A %Y-%m-%d") for o in range(8))
-    date_context = (f"[Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}. "
-                    f"Dates this coming week: {upcoming}. "
-                    f"Use these exact dates for any day the user names.]")
 
     cases = [
         ("what's the weather in Boston right now", {"get_current_weather"}),
@@ -392,11 +417,15 @@ def suite_tools():
     for text, expected in cases:
         group, tools = j.select_tools(text)
         r = chat(model="qwen2.5:7b", tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
-                 options=det,
-                 messages=[{"role": "system", "content": j.system_prompt},
-                           {"role": "user", "content": f"{date_context} {text}"}])
+                 options=det, messages=j.tool_messages(text, []))
         called = [c.function.name for c in (r.message.tool_calls or [])]
         via = ""
+        if not called and len(j.TOOL_GROUPS.get(group, [])) > len(tools):
+            # What handle_turn does next: retry with the whole agent
+            r = chat(model="qwen2.5:7b", tools=j.TOOL_GROUPS[group], keep_alive=j.OLLAMA_KEEP_ALIVE,
+                     options=det, messages=j.tool_messages(text, []))
+            called = [c.function.name for c in (r.message.tool_calls or [])]
+            via = " (whole-agent retry)" if called else ""
         if not called and group in j.DEFAULT_CALLS and j.looks_like_request(text):
             # What handle_turn does when the model declines: run the group's default
             default = j.DEFAULT_CALLS[group](text)
@@ -411,19 +440,6 @@ def suite_tools():
     check("model picks a sensible tool for each request", correct == len(cases),
           f"{correct}/{len(cases)}")
 
-    # A routed group that produces nothing must still be recoverable, because
-    # that is exactly what handle_turn does before giving up.
-    if misses:
-        text, group, _ = misses[0]
-        r = chat(model="qwen2.5:7b", tools=j.ALL_TOOLS, keep_alive=j.OLLAMA_KEEP_ALIVE,
-                 options=det,
-                 messages=[{"role": "system", "content": j.system_prompt},
-                           {"role": "user", "content": f"{date_context} {text}"}])
-        recovered = [c.function.name for c in (r.message.tool_calls or [])]
-        check("retry with the full registry recovers a missed route",
-              bool(recovered), f"{text!r} -> {recovered or 'still nothing'}")
-    else:
-        print("        (no misses, retry path not exercised)")
 
     # The weekday-arithmetic bug: "Friday" used to land on the wrong date.
     friday = None
@@ -434,8 +450,7 @@ def suite_tools():
             break
     group, tools = j.select_tools("remind me to call mom on Friday at 2pm")
     r = chat(model="qwen2.5:7b", tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
-             messages=[{"role": "system", "content": j.system_prompt},
-                       {"role": "user", "content": f"{date_context} remind me to call mom on Friday at 2pm"}])
+             messages=j.tool_messages("remind me to call mom on Friday at 2pm", []))
     args = (r.message.tool_calls or [{}])
     due = ""
     if r.message.tool_calls:
@@ -474,17 +489,16 @@ def suite_latency():
     t = time.time()
     try:
         j.retrieve_memories("what's the weather in Boston")
-        results.append(("pinecone retrieval", time.time() - t, 2.0))
+        results.append(("memory recall", time.time() - t, 0.5))
     except Exception as e:
-        print(f"        pinecone unavailable: {e}")
+        print(f"        memory recall unavailable: {e}")
 
     t = time.time()
     j.route_tools("what's the weather in Boston")
     results.append(("keyword routing", time.time() - t, 0.01))
 
     group, tools = j.select_tools("what's the weather in Boston right now")
-    msgs = [{"role": "system", "content": j.system_prompt},
-            {"role": "user", "content": "what's the weather in Boston right now"}]
+    msgs = j.tool_messages("what's the weather in Boston right now", [])
     chat(model="qwen2.5:7b", messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)  # warm
     t = time.time()
     chat(model="qwen2.5:7b", messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)
@@ -520,18 +534,21 @@ INTENT_CASES = [
     ("What reminders do I have today?", "tool"), ("Pause the music.", "tool"),
     ("Will it rain in Toronto tomorrow?", "tool"),
     ("Tell me a joke.", "chat"), ("I skipped lunch today.", "chat"),
-    ("I prefer temperatures in Celsius, by the way.", "chat"), ("What's the capital of France?", "chat"),
+    ("I prefer temperatures in Celsius, by the way.", "tool"), ("What's the capital of France?", "chat"),
     ("Explain how a neural network works.", "chat"), ("My sister's birthday is next week.", "chat"),
     ("I'm feeling tired today.", "chat"), ("Thanks, that's helpful.", "chat"),
     ("Can you help me write a poem about rain?", "chat"), ("Interesting, tell me more.", "chat"),
+    ("Call me Captain from now on.", "tool"), ("What's the date next Friday?", "tool"),
+    ("What's Sarah's phone number?", "tool"), ("Search my notes for the wifi password.", "tool"),
+    ("How many days until Christmas?", "tool"), ("I live in Boston.", "tool"),
 ]
 
 
 def suite_intent():
     """
     Intent routing — classifier plus decide_intent() — on labelled phrases.
-    llama3.2:1b scored 13/29 here and never recognised a goodbye; the qwen
-    few-shot classifier with the guards scored 28/29.
+    llama3.2:1b scored 13/29 on the first 29 of these and never recognised a
+    goodbye; the qwen few-shot classifier with the guards scored 28/29.
     """
     header("intent")
     j = load_jarvis()
@@ -548,10 +565,114 @@ def suite_intent():
     exits = [t for t, w in INTENT_CASES if w == "exit"]
     check("every goodbye ends the conversation",
           all(j.decide_intent(t, j.classify_intent(t)) == "exit" for t in exits))
-    statements = ["I skipped lunch today.", "My sister's birthday is next week.",
-                  "I prefer temperatures in Celsius, by the way."]
+    statements = ["I skipped lunch today.", "My sister's birthday is next week."]
     check("statements never trigger tools",
           all(j.decide_intent(t, "tool") != "tool" for t in statements))
+    check("stated preferences do reach the preferences tool",
+          j.decide_intent("I prefer temperatures in Celsius, by the way.", "chat") == "tool"
+          and j.route_tools("I prefer temperatures in Celsius, by the way.")[0] == "preferences")
+
+
+def suite_prefs():
+    """Preferences store, in a throwaway folder and vault. Doesn't load jarvis.py."""
+    header("prefs")
+    import os
+    import tempfile
+    from pathlib import Path
+    import preferences
+
+    saved_path, saved_vault = preferences.PATH, os.environ.get("OBSIDIAN_VAULT_PATH")
+    with tempfile.TemporaryDirectory() as tmp:
+        preferences.PATH = Path(tmp) / "preferences.json"
+        os.environ["OBSIDIAN_VAULT_PATH"] = tmp
+        try:
+            check("starts empty", preferences.statements() == [] and preferences.prompt_block() == "")
+            check("known preference saved", "celsius" in preferences.set_preference("temperature_units", "Celsius")
+                  and preferences.get("temperature_units") == "celsius")
+            check("aliases map to known names", preferences.set_preference("call me", "Captain")
+                  and preferences.get("address_as") == "Captain" and preferences.address() == "Captain")
+            check("invalid value refused", "must be one of" in preferences.set_preference("units", "kelvin")
+                  and preferences.get("temperature_units") == "celsius")
+            preferences.set_preference("note", "Prefers short answers")
+            preferences.set_preference("note", "prefers short answers")
+            check("free-form notes kept once", preferences.load()["notes"] == ["Prefers short answers"])
+            block = preferences.prompt_block()
+            check("prompt block lists everything", all(s in block for s in
+                  ("Give temperatures in celsius.", 'Address the user as "Captain".', "Prefers short answers")))
+            mirror = Path(tmp) / "Memory" / "Preferences.md"
+            check("mirrored to Obsidian", mirror.exists() and "Prefers short answers" in mirror.read_text())
+            check("forget by name", preferences.forget("address_as") == "Forgot address_as."
+                  and preferences.address() == "sir")
+            check("forget a note by its words", "Forgot 1" in preferences.forget("short answers"))
+        finally:
+            preferences.PATH = saved_path
+            if saved_vault is None:
+                os.environ.pop("OBSIDIAN_VAULT_PATH", None)
+            else:
+                os.environ["OBSIDIAN_VAULT_PATH"] = saved_vault
+
+
+def suite_everyday():
+    """Date tools, checked against today's real calendar. Needs no permissions."""
+    header("everyday")
+    from datetime import date, timedelta
+    from agents import EverydayToolsAgent
+
+    e = EverydayToolsAgent()
+    today = date.today()
+    coming_friday = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+
+    def resolved(phrase):
+        r = e.resolve_date(phrase)
+        return r.get("date", "")[-10:] if isinstance(r, dict) else r
+
+    check("tomorrow", resolved("tomorrow") == str(today + timedelta(days=1)))
+    check("the day after tomorrow", resolved("the day after tomorrow") == str(today + timedelta(days=2)),
+          resolved("the day after tomorrow"))
+    check("this Friday is the coming one", resolved("this Friday") == str(coming_friday))
+    note = e.resolve_date("next Friday").get("note", "")
+    check("'next Friday' names both candidates",
+          str(coming_friday) in note and str(coming_friday + timedelta(days=7)) in note, note[:80])
+    check("'in 10 days'", resolved("in 10 days") == str(today + timedelta(days=10)))
+    check("no invented time", "time" not in e.resolve_date("three weeks from now"))
+    check("a stated time is kept", e.resolve_date("tomorrow at 3pm").get("time") == "15:00")
+    check("nonsense is refused", isinstance(e.resolve_date("blorp"), str))
+    days = e.days_between("today", f"{today.year}-12-31")
+    check("days_between", days["days"] == (date(today.year, 12, 31) - today).days)
+
+
+def suite_recall():
+    """
+    On-device vector memory in a throwaway folder, and the Obsidian fallback.
+    Needs Ollama with nomic-embed-text; doesn't load jarvis.py.
+    """
+    header("recall")
+    import tempfile
+    from pathlib import Path
+    import memory_store
+    import obsidian_store
+
+    saved_dir = memory_store.DATA_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        memory_store.DATA_DIR = Path(tmp) / "chroma"
+        try:
+            store = memory_store.MemoryStore()
+            records = [{"text": "The user prefers clean code with proper comments.", "kind": "fact", "date": "2026-06-10"},
+                       {"text": "The user's sister Priya loves jazz.", "kind": "fact", "date": "2026-09-28"}]
+            check("records added", store.add(records) == 2 and store.count() == 2)
+            store.add(records)
+            check("re-adding doesn't duplicate", store.count() == 2)
+            t = time.time()
+            hits = store.search("what kind of music does my sister like")
+            took = time.time() - t
+            check("finds the related memory", any("Priya" in h for h in hits), str(hits)[:100])
+            check("tags hits with their date", bool(hits) and hits[0].startswith("(2026-"))
+            check("recall is fast", took < 0.5, ms(took))
+            check("unrelated question recalls nothing", store.search("what's the capital of Peru") == [],
+                  str(store.search("what's the capital of Peru"))[:100])
+        finally:
+            memory_store.DATA_DIR = saved_dir
+    check("Obsidian keyword fallback runs", isinstance(obsidian_store.search("anything at all"), list))
 
 
 def suite_wake():
@@ -699,13 +820,17 @@ SUITES = {
     "tools": suite_tools,
     "latency": suite_latency,
     "intent": suite_intent,
+    "prefs": suite_prefs,
+    "everyday": suite_everyday,
+    "recall": suite_recall,
     "wake": suite_wake,
     "memory": suite_memory,
     "voice": suite_voice,
 }
 
 QUICK = ["imports", "registry", "routing", "text"]
-DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "intent", "latency", "wake", "memory"]
+DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "intent", "latency",
+           "wake", "memory", "prefs", "everyday", "recall"]
 
 
 def main():

@@ -16,8 +16,11 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import base64
 import json
+import re
 import subprocess
 from email.message import EmailMessage
+
+import preferences
 
 load_dotenv()
 
@@ -291,7 +294,8 @@ class WeatherSearch():
         location = (location or "").strip()
         if location.lower() in self.HOME_WORDS:
             location = ""
-        location = location or os.getenv("JARVIS_HOME_LOCATION", "").strip()
+        # A home set by voice ("I live in Boston") beats the one in .env
+        location = location or preferences.get("home_location") or os.getenv("JARVIS_HOME_LOCATION", "").strip()
         if not location:
             raise ValueError("No location given and no home location is set. Ask the user which city.")
         key = location.lower()
@@ -306,11 +310,18 @@ class WeatherSearch():
             self._places[key] = (place["lat"], place["lon"], label)
         return self._places[key]
 
+    @staticmethod
+    def _units():
+        """(OpenWeather units, label for the model), following the user's preference."""
+        if preferences.get("temperature_units") == "celsius":
+            return "metric", "celsius, m/s"
+        return "imperial", "fahrenheit, mph"
+
     def _onecall(self, location: str, exclude: str):
         """Internal helper. One Call 3.0 for a place; returns (data, label)."""
         lat, lon, label = self._locate(location)
         response = requests.get(self.ONECALL_URL, timeout=10, params={
-            "lat": lat, "lon": lon, "exclude": exclude, "units": "imperial",
+            "lat": lat, "lon": lon, "exclude": exclude, "units": self._units()[0],
             "appid": os.getenv("OPENWEATHER_API_KEY")})
         data = response.json()
         if response.status_code != 200:
@@ -327,7 +338,7 @@ class WeatherSearch():
         """
         # Excludes the noisy blocks — minutely alone is 60 entries of rainfall
         data, label = self._onecall(location, "minutely,hourly,daily")
-        return {"location": label, "units": "fahrenheit, mph", "current": data.get("current", {}),
+        return {"location": label, "units": self._units()[1], "current": data.get("current", {}),
                 "alerts": data.get("alerts", [])}
 
     def get_weather_with_time(self, location: str, target_hour: str):
@@ -350,7 +361,7 @@ class WeatherSearch():
                 break
         if match:
             match = {"time": self._local_label(match["dt"], timezone_offset, "%A %H:%M"), **match}
-        return {"location": label, "units": "fahrenheit, mph", "hour": match}
+        return {"location": label, "units": self._units()[1], "hour": match}
 
     def get_daily_forecast(self, location: str, days: int = 7):
         """
@@ -370,7 +381,7 @@ class WeatherSearch():
             daily[0]["date"] += " (today)"
         if len(daily) > 1:
             daily[1]["date"] += " (tomorrow)"
-        return {"location": label, "units": "fahrenheit, mph", "daily": daily}
+        return {"location": label, "units": self._units()[1], "daily": daily}
 
     @staticmethod
     def _local_label(timestamp, offset, fmt):
@@ -1532,3 +1543,277 @@ class RemindersAgent():
                 return f"You already have a list called '{list_name}'."
             return result["error"]
         return f"Created a new reminder list called '{result['name']}'."
+
+
+def _run_jxa(script: str, params: dict, app_label: str):
+    """
+    Runs a JXA script with params passed as a JSON argv element (never spliced
+    into the script, so user text can't break or inject anything) and decodes
+    the JSON it prints. Errors come back as {"error": "..."} worth speaking.
+    """
+    try:
+        result = subprocess.run(["osascript", "-l", "JavaScript", "-e", script, json.dumps(params)],
+                                capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return {"error": f"{app_label} took too long to respond. It may be launching — try again in a moment."}
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "-1743" in stderr or "Not authorized" in stderr:
+            return {"error": f"I don't have permission to use {app_label}. Allow it under System Settings, "
+                             f"Privacy and Security, Automation."}
+        return {"error": f"{app_label} returned an error: {stderr[:200]}"}
+    try:
+        return json.loads(result.stdout.strip() or "null")
+    except json.JSONDecodeError:
+        return {"error": f"Could not read the response from {app_label}."}
+
+
+class EverydayToolsAgent():
+    """
+    Everyday lookups Jarvis can use whenever he needs a detail: dates and
+    times, the people in Contacts, every calendar in the macOS Calendar app,
+    and Apple Notes. Read-only — nothing here changes the user's data.
+    """
+
+    def __init__(self):
+        import parsedatetime
+        self._dates = parsedatetime.Calendar(version=parsedatetime.VERSION_CONTEXT_STYLE)
+        self._event_store = None
+
+    # ------------------------------------------------------------ dates
+
+    def _resolve(self, expression: str):
+        """Internal helper. A date phrase -> (datetime, has_time), or None."""
+        text = (expression or "").strip()
+        if not text or text.lower() in ("now", "today"):
+            return datetime.datetime.now(), text.lower() == "now"
+        # Phrases parsedatetime gets wrong: "the day after tomorrow" came back as tomorrow
+        lowered = text.lower()
+        for phrase, meaning in (("day after tomorrow", "in 2 days"), ("day before yesterday", "2 days ago")):
+            if phrase in lowered:
+                text = meaning
+        parsed, context = self._dates.parseDT(text, sourceTime=datetime.datetime.now())
+        if not context.hasDateOrTime:
+            return None
+        # "Three weeks from now" carries the current clock time along; only
+        # report a time the user actually said.
+        said_time = bool(re.search(r"\d|noon|midnight|morning|afternoon|evening|tonight", lowered))
+        return parsed, context.hasTime and said_time
+
+    def get_current_time(self):
+        """
+        The current date, day of the week and local time.
+        Use for 'what time is it', 'what's today's date' or 'what day is it'.
+        """
+        now = datetime.datetime.now().astimezone()
+        return now.strftime("%A, %B %d, %Y, %I:%M %p %Z").replace(" 0", " ")
+
+    def resolve_date(self, expression: str):
+        """
+        Work out the exact calendar date for a phrase such as 'next Friday',
+        'tomorrow at 3pm', 'in 10 days', 'three weeks from now' or 'October 12'.
+        Use this whenever a date must be exact — never work out weekdays yourself.
+        """
+        resolved = self._resolve(expression)
+        if resolved is None:
+            return f"Couldn't understand {expression!r} as a date."
+        when, has_time = resolved
+        today = datetime.date.today()
+        result = {"expression": expression,
+                  "date": when.strftime("%A %Y-%m-%d"),
+                  "days_from_today": (when.date() - today).days}
+        if has_time:
+            result["time"] = when.strftime("%H:%M")
+        # "Next Friday" said on a Tuesday means this Friday to some people and
+        # the one after to others — say both rather than silently pick one.
+        words = expression.lower().split()
+        if "next" in words:
+            weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            named = [w for w in words if w in weekdays]
+            if named:
+                ahead = (weekdays.index(named[0]) - today.weekday()) % 7 or 7
+                coming = today + datetime.timedelta(days=ahead)
+                result["note"] = (f"'next {named[0].title()}' can mean the coming one, "
+                                  f"{coming:%A %Y-%m-%d}, or the one after, "
+                                  f"{coming + datetime.timedelta(days=7):%A %Y-%m-%d}. Confirm if it matters.")
+        return result
+
+    def days_between(self, start: str, end: str = "today"):
+        """
+        Count the days between two dates or date phrases, e.g. start='today',
+        end='Christmas' or end='2026-12-25'. Use for 'how many days until...'.
+        """
+        a, b = self._resolve(start), self._resolve(end)
+        if a is None or b is None:
+            return f"Couldn't understand {start if a is None else end!r} as a date."
+        days = (b[0].date() - a[0].date()).days
+        return {"from": a[0].strftime("%A %Y-%m-%d"), "to": b[0].strftime("%A %Y-%m-%d"), "days": days}
+
+    # ------------------------------------------------------------ contacts
+
+    CONTACTS_SCRIPT = r"""
+    function run(argv) {
+        const p = JSON.parse(argv[0]);
+        const app = Application("Contacts");
+        const people = app.people.whose({name: {_contains: p.name}})();
+        return JSON.stringify(people.slice(0, p.limit).map(person => {
+            const birthday = person.birthDate();
+            return {
+                name: person.name(),
+                organization: person.organization() || null,
+                phones: person.phones().map(x => ({label: x.label(), value: x.value()})),
+                emails: person.emails().map(x => ({label: x.label(), value: x.value()})),
+                addresses: person.addresses().map(x => x.formattedAddress()),
+                birthday: birthday ? birthday.toISOString().slice(0, 10) : null,
+            };
+        }));
+    }
+    """
+
+    def find_contact(self, name: str):
+        """
+        Look someone up in the user's Contacts: phone numbers, email addresses,
+        postal addresses, birthday and company. Use before emailing or calling
+        someone by name, or when asked for a person's details.
+        """
+        found = _run_jxa(self.CONTACTS_SCRIPT, {"name": name.strip(), "limit": 5}, "Contacts")
+        if isinstance(found, dict) and "error" in found:
+            return found["error"]
+        return found or f"No contact matching {name!r}."
+
+    # ------------------------------------------------------------ calendar
+
+    def _calendar_access(self):
+        """
+        Internal helper. The EventKit store, asking for access the first time.
+        EventKit (not Calendar scripting) because scripting misses recurring
+        events — every weekly meeting — and is far slower.
+        """
+        import threading
+        import EventKit
+        if self._event_store is None:
+            self._event_store = EventKit.EKEventStore.alloc().init()
+        status = EventKit.EKEventStore.authorizationStatusForEntityType_(EventKit.EKEntityTypeEvent)
+        if status == 0:     # not asked yet: macOS shows its permission prompt now
+            answered = threading.Event()
+            request = getattr(self._event_store, "requestFullAccessToEventsWithCompletion_", None)
+            if request:
+                request(lambda granted, error: answered.set())
+            else:
+                self._event_store.requestAccessToEntityType_completion_(
+                    EventKit.EKEntityTypeEvent, lambda granted, error: answered.set())
+            answered.wait(60)
+            status = EventKit.EKEventStore.authorizationStatusForEntityType_(EventKit.EKEntityTypeEvent)
+        # 3 = authorised (full access on macOS 14+)
+        return self._event_store if status == 3 else None
+
+    def get_apple_calendar_events(self, start_date: str = "today", end_date: str = "in 7 days"):
+        """
+        Events from every calendar in the macOS Calendar app — iCloud, Exchange,
+        work, shared, subscribed and holiday calendars, and any Google accounts
+        added to it. Use when asked about all calendars or a calendar that isn't
+        the Google one. Dates as YYYY-MM-DD or phrases like 'tomorrow' or 'next Monday'.
+        """
+        import Foundation
+        store = self._calendar_access()
+        if store is None:
+            return ("I don't have access to your calendars. Allow Jarvis under System Settings, "
+                    "Privacy and Security, Calendars.")
+        start, end = self._resolve(start_date), self._resolve(end_date)
+        if start is None or end is None:
+            return "Couldn't understand those dates."
+        start_day = datetime.datetime.combine(start[0].date(), datetime.time.min)
+        end_day = datetime.datetime.combine(end[0].date(), datetime.time.max)
+        predicate = store.predicateForEventsWithStartDate_endDate_calendars_(
+            Foundation.NSDate.dateWithTimeIntervalSince1970_(start_day.timestamp()),
+            Foundation.NSDate.dateWithTimeIntervalSince1970_(end_day.timestamp()), None)
+        events = []
+        for event in sorted(store.eventsMatchingPredicate_(predicate), key=lambda e: e.startDate().timeIntervalSince1970()):
+            begins = datetime.datetime.fromtimestamp(event.startDate().timeIntervalSince1970())
+            ends = datetime.datetime.fromtimestamp(event.endDate().timeIntervalSince1970())
+            events.append({
+                "title": event.title(),
+                "calendar": event.calendar().title(),
+                "start": begins.strftime("%A %Y-%m-%d") if event.isAllDay() else begins.strftime("%A %Y-%m-%d %H:%M"),
+                "end": None if event.isAllDay() else ends.strftime("%H:%M"),
+                "all_day": bool(event.isAllDay()),
+                "location": event.location() or None,
+            })
+        if not events:
+            return f"No events between {start_day:%A %B %d} and {end_day:%A %B %d}."
+        return events[:50]
+
+    # ------------------------------------------------------------ notes
+
+    NOTES_SEARCH_SCRIPT = r"""
+    function run(argv) {
+        const p = JSON.parse(argv[0]);
+        const app = Application("Notes");
+        const notes = app.notes.whose({_or: [{name: {_contains: p.query}},
+                                            {plaintext: {_contains: p.query}}]})();
+        return JSON.stringify(notes.slice(0, p.limit).map(n => ({
+            title: n.name(),
+            folder: n.container().name(),
+            modified: n.modificationDate().toISOString().slice(0, 10),
+            preview: n.plaintext().slice(0, 300),
+        })));
+    }
+    """
+    NOTES_READ_SCRIPT = r"""
+    function run(argv) {
+        const p = JSON.parse(argv[0]);
+        const app = Application("Notes");
+        const notes = app.notes.whose({name: {_contains: p.title}})();
+        if (notes.length === 0) return JSON.stringify(null);
+        const n = notes[0];
+        return JSON.stringify({title: n.name(), folder: n.container().name(),
+                               modified: n.modificationDate().toISOString().slice(0, 10),
+                               text: n.plaintext().slice(0, p.max_chars)});
+    }
+    """
+
+    def search_notes(self, query: str):
+        """
+        Search the user's Apple Notes by title and content. Returns matching
+        notes with a short preview; use read_note for the full text.
+        """
+        found = _run_jxa(self.NOTES_SEARCH_SCRIPT, {"query": query.strip(), "limit": 8}, "Notes")
+        if isinstance(found, dict) and "error" in found:
+            return found["error"]
+        return found or f"No notes mention {query!r}."
+
+    def read_note(self, title: str):
+        """Read the full text of an Apple Note by its title (or part of it)."""
+        found = _run_jxa(self.NOTES_READ_SCRIPT, {"title": title.strip(), "max_chars": 4000}, "Notes")
+        if isinstance(found, dict) and "error" in found:
+            return found["error"]
+        return found or f"No note titled {title!r}."
+
+
+class PreferencesAgent():
+    """
+    The user's standing preferences — told once, kept in every conversation.
+    Stored on this Mac and mirrored to the Obsidian vault (see preferences.py).
+    """
+
+    def set_preference(self, name: str, value: str):
+        """
+        Save a preference the user states so Jarvis keeps to it from now on.
+        name is one of: temperature_units (value 'celsius' or 'fahrenheit'),
+        home_location (a city), address_as (what to call the user, e.g. 'Rino'),
+        or 'note' for anything else, with value a short sentence such as
+        'Prefers short answers'. Use whenever the user says 'I prefer...',
+        'from now on...', 'call me...' or 'I live in...'.
+        """
+        return preferences.set_preference(name, value)
+
+    def forget_preference(self, name: str):
+        """
+        Remove a saved preference: a name such as 'temperature_units' or
+        'home_location', or words from a saved note.
+        """
+        return preferences.forget(name)
+
+    def list_preferences(self):
+        """Everything the user has asked Jarvis to keep to."""
+        return preferences.statements() or "No preferences saved yet."

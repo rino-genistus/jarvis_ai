@@ -14,11 +14,16 @@ jarvis_ai/
 ├── wake_listener.py   # Always-on entry point (what Jarvis.app runs): wake word + engine lifecycle
 ├── wake_word.py       # Lean "Hey Jarvis" detector: openWakeWord's ONNX models on onnxruntime
 ├── jarvis.py          # Engine: conversation loop, intent + tool routing, memory, TTS
-├── mic.py             # Command recording (light imports, usable before jarvis.py loads)
-├── obsidian_store.py  # Daily memory notes in the Obsidian vault
+├── mic.py             # Command recording: room-fitted thresholds + speech check (light imports)
+├── memory_store.py    # On-device vector memory: Chroma + Ollama embeddings
+├── obsidian_store.py  # Obsidian vault: daily notes, topic notes, keyword recall fallback
+├── preferences.py     # Standing preferences (data/preferences.json, mirrored to Obsidian)
 ├── agents.py          # All agent classes; every public method is a tool
+├── tool_catalog.py    # AGENT_TOOLS: each agent's tools, their trigger words and acknowledgements
+├── status.py          # "Is Jarvis working?" report — CLI and the Jarvis Status app
 ├── tests.py           # Test harness
-├── build_app.sh       # Builds Jarvis.app and installs it into Applications
+├── build_app.sh       # Builds Jarvis.app and Jarvis Status.app into Applications
+├── data/              # On this Mac only (gitignored): chroma/ vector store, preferences.json
 ├── assets/            # make_icon.py (draws the icon) and the generated Jarvis.icns
 ├── requirements.txt   # Python dependencies (Python 3.12 — Kokoro doesn't support 3.13+)
 ├── PROGRESS.md        # Public progress summary and roadmap
@@ -52,9 +57,13 @@ engine process — spawned on first wake, ~2.7 GB warm (+ Ollama models)
 - The engine exits by itself if the listener disappears (EOF or broken pipe on the pipe). The listener turns SIGTERM into a clean shutdown, so `pkill` doesn't orphan the engine.
 - An engine crash plays a low error tone, and the listener keeps running. The next wake word spawns a fresh engine.
 - A file lock (`logs/jarvis.lock`) prevents two listeners fighting over the microphone.
-- Clicking the app shows a macOS notification, since there is no window or Dock icon:
-  - "Jarvis is listening" when it starts. If `credentials.json` or `.env` is missing (`SETUP_FILES`), the notification names the services that are off.
-  - "already running" if it is running already.
+- Opening the app shows a "Jarvis is listening" notification, since there is no window or Dock icon. If `credentials.json` or `.env` is missing (`SETUP_FILES`), it names the services that are off.
+- The pipe messages are `("wake", noise_floor)` / `("quit", None)` from the listener and `"idle"` from the engine. `noise_floor` is the median loudness of the last 30 s of mic frames; see Microphone.
+
+### Health: status.json, status.py, Jarvis Status.app
+- Once a minute (`HEARTBEAT_SECONDS`) the listener writes `logs/status.json`: state, engine warm/off, last wake and today's count, the minute's peak mic level and best wake score, the noise floor, and whether the mic is delivering pure silence. Pure silence is what macOS gives an app without microphone permission, and it is logged as a warning.
+- `python status.py` checks every link: process alive, heartbeat fresh, mic level, Ollama running with the models, and any recent crash in the log. It exits 1 on a failure.
+- **Jarvis Status.app** shows the same report as a dialog, with **Restart Jarvis** and **Open Log** buttons. It's a separate app because a second click on Jarvis.app never runs any code: macOS just brings the running app forward.
 - A PortAudio error on the wake stream (for example `-9986`) is retried after 2 s instead of crashing.
 
 ### Wake Word (wake_word.py)
@@ -65,18 +74,22 @@ engine process — spawned on first wake, ~2.7 GB warm (+ Ollama models)
 ### Conversation (jarvis.py)
 ```
 run_session(first_audio=None)
+  start: messages[0] = build_system_prompt()   (today's date + preferences)
   loop:
-    wait_until_spoken() → mic.record_command()     None after 10 s silence → end
+    wait_until_spoken() → mic.record_command(follow_up=...)
+        None after 10 s silence → end;  NOISE (loud but not speech) → skip
         ↓
     transcribe() [whisper-small-mlx, from a numpy array — no ffmpeg or temp file]
-        ↓
+        ↓  is_speech()? two non-speech results in a row → end
     handle_turn(text, transcript) → True on exit intent → end
   end: falling sleep tone → clear history → remember_in_background(transcript)
 ```
 
 `handle_turn`:
 ```
-classify_intent() [llama3.2:1b]  ║  retrieve_memories() [Pinecone]    ← run in parallel
+clear lookup request? ── yes → select_tools() → acknowledgement() at ~0s → retrieve_memories() → tool
+        │ no
+classify_intent() [qwen2.5:7b]  ║  retrieve_memories() [Chroma → Obsidian]    ← run in parallel
         ↓
    ┌────────────────┼────────────────┐
  exit              tool             chat
@@ -96,29 +109,40 @@ speak_stream() → say() → speaker thread → Kokoro → sounddevice → chime
 - **`chat`**: general conversation → streamed `qwen2.5:7b` reply, no tools
 
 `decide_intent(text, classified)` then applies two guards:
-- A **request** (`looks_like_request()`: a `?`, a command verb up front, or an embedded "remind me" / "can you") whose keywords point at a lookup group (`LOOKUP_GROUPS`: weather, calendar, email, reminders, web) becomes `tool` even if the classifier said `chat`. Music is excluded, because "skip" and "play" turn up in ordinary talk.
-- A **statement** is never `tool`. Offered calendar tools for "my sister's birthday is next week", the model may create an event nobody asked for.
+- A **stated preference** (keywords in the `preferences` group: "I prefer", "from now on", "call me", "I live in") is always `tool`, so it's saved immediately.
+- A **request** (`looks_like_request()`: a `?`, a command verb up front, or an embedded "remind me" / "can you") whose keywords point at a lookup group (`LOOKUP_GROUPS`: weather, calendar, email, reminders, web, everyday) becomes `tool` even if the classifier said `chat`. Music is excluded, because "skip" and "play" turn up in ordinary talk.
+- Any other **statement** is never `tool`. Offered calendar tools for "my sister's birthday is next week", the model may create an event nobody asked for.
 
-Measured on the 29 labelled phrases in `tests.py` (`INTENT_CASES`): the old `llama3.2:1b` classifier scored 13/29 and never recognised a goodbye; the qwen classifier plus the guards score 28/29, for about 170 ms more per turn. Run `python tests.py intent` after changing either.
+Measured on the labelled phrases in `tests.py` (`INTENT_CASES`): the old `llama3.2:1b` classifier scored 13/29 on the original set and never recognised a goodbye. The qwen classifier plus the guards score 34/35 on the current set, for about 170 ms more per turn. Run `python tests.py intent` after changing either.
+
+**Fast path:** when `decide_intent(text, "chat")` is already `tool` (a clear request with lookup keywords, or a stated preference) and the text isn't a goodbye (`GOODBYE`), the classifier is skipped. The guards would overrule it anyway. The acknowledgement is spoken at ~0 s, before memory recall and tool selection.
 
 ### Tool Routing (intent == 'tool')
-Sending all 45 tool schemas costs about 3,600 prompt tokens and makes qwen2.5:7b ignore tools. `select_tools()` narrows the set:
-1. `route_tools()`: keyword match against `GROUP_KEYWORDS`, with no LLM call
-2. `classify_tool_group()`: `llama3.2:1b` picks a group if no keyword matched
-3. Fallback: `ALL_TOOLS`
+Tool selection time is prompt reading: qwen2.5:7b on the M4 reads about 200 tokens/s, and Ollama's single cache slot is usually taken by the previous chat or classifier call. All 55 schemas are about 5,400 tokens and make qwen ignore tools; all 14 Gmail schemas with the full system prompt measured 10.3 s cold. `select_tools()` narrows in two steps:
+1. **Agent:** `route_tools()` matches `GROUP_KEYWORDS` with no LLM call, then `classify_tool_group()` (`llama3.2:1b`) if nothing matched, then `ALL_TOOLS` as a last resort.
+2. **Tools within the agent:** `tool_catalog.pick()` keeps only the tools whose `words` the request contains, at most `MAX_PICKED` (4), best match first, plus any tool they `needs` (moving an event needs `get_calendar_events` to find its id). A tool that's only there as a helper never leads. With no match, it sends the agent's first `FALLBACK_COUNT` (2) tools, so the most common reads go first in each agent's entry.
+
+`tool_catalog.AGENT_TOOLS` is `{agent class: {tool: Tool(words, ack, needs)}}`. `build_tool_groups()` raises at startup if a registered tool is missing from it or it names a tool no agent defines. A tool may be listed under a second agent to be offered in that group too (Apple Calendar under `Calendar_Agents`).
 
 If the routed group yields no tool call:
-1. **`DEFAULT_CALLS`**: if the text is a request and the group has an obvious action, Jarvis runs it itself. Weather runs `get_current_weather(location="home")`; music turns "play X" into `search_song_and_queue(query=X)`. This exists because qwen2.5:7b narrates ("I'll check the weather at home…") or declines "play some jazz", even at temperature 0.
-2. Otherwise, the call is retried once with `ALL_TOOLS`.
+1. **`DEFAULT_CALLS`**: if the text is a request and the group has an obvious action, Jarvis runs it itself:
+   - weather runs `get_current_weather(location="home")`;
+   - music turns "play X" into `search_song_and_queue(query=X)`;
+   - everyday sends time questions to `get_current_time` and date questions to `resolve_date(<the question>)`.
+
+   This exists because qwen2.5:7b narrates ("I'll check the weather at home…") or declines "play some jazz", even at temperature 0.
+2. Otherwise, the call is retried once with the agent's whole tool list (`TOOL_GROUPS[group]`). There is no retry with `ALL_TOOLS`, which would take about 30 s.
 
 ### Tool Execution
-1. Prefix the user message with `date_reference()`: today's date and the named dates of the coming week (qwen gets weekdays wrong from an ISO date alone). The chat path gets the same prefix. Both use a copy of the last message, so the stored history, and the prompt cache, are unchanged.
-2. Speak `acknowledgement(group)`, a short phrase fitting the group ("Let me check your calendar.", "Pulling up the forecast."), never the same one twice in a row. It is queued, so it plays over the model call. A disabled group gets `not_set_up_reply()` instead.
-3. Call `qwen2.5:7b` with the selected tools.
+1. Speak `acknowledgement(group, tools)`: a phrase from the leading tool's `ack` in `tool_catalog`, worded for the action ("Let me see what's come in." for unread email, "Sure, let me take that off your calendar." for a delete), never the same one twice in a row. It is queued, so it plays over everything that follows. A disabled group gets `not_set_up_reply()` instead.
+2. Build the short conversation with `tool_messages()`: `TOOL_PROMPT` (the persona in four lines, not the ~600-token system prompt) plus preferences, the last `TOOL_CONTEXT_TURNS` (4) turns in plain words, and the request prefixed with `date_reference()`. qwen gets weekdays wrong from an ISO date alone; the chat path gets the same date prefix.
+3. Call `qwen2.5:7b` with the picked tools.
 4. Execute each `tool_call` via `TOOL_REGISTRY[name](**args)`. Exceptions become a text result instead of crashing.
-5. Append results as `role: tool` messages with `tool_name` (Ollama format).
-6. Ask for a two-sentence summary **with the same tools list**. This keeps Ollama's KV cache prefix; a different prefix cost 13.5 s on the next command.
-7. Stream the summary to speech.
+5. Append results as `role: tool` messages with `tool_name` (Ollama format). The main `messages` history gets the call and results too, each cut to `TOOL_RESULT_HISTORY_CHARS`, for later chat turns.
+6. Ask for a two-sentence summary on the same short conversation **with the same tools list**, so Ollama only reads the new tool results. The request quotes the acknowledgement so the summary doesn't repeat it.
+7. Stream the summary to speech. If the summary comes back empty (qwen sometimes answers it with another tool call and no words), ask once more with no tools on offer.
+
+Measured with a cold cache: tool selection 1.8–3.8 s, down from 6–8 s. Most of what remains is the tool itself (Gmail 2.8 s, Reminders 4–5 s through AppleScript) and reading its output (unread email is about 1,200 tokens, around 6 s).
 
 ### Memory System
 Each session is saved once it ends, on a background thread (`remember_in_background`). The thread is non-daemon and tracked, so `shutdown()` / `flush_memories()` wait for it.
@@ -134,10 +158,17 @@ Rules that came from observed failures:
 - The model sees only the existing topics that `relevant_topics()` finds in the conversation (any 4+ letter word of the name). Showing every topic made it attach unrelated ones.
 - `date_reference(15)` is in the prompt so relative dates resolve to calendar dates.
 
-**Pinecone** (search):
-- Index `jarvis-ai`, namespace `jarvis-memory-namespace`, integrated embedding `llama-text-embed-v2`, `field_map {"text": "chunk_text"}`.
-- Records are `{"id": "mem-<ts>-<i>" | "episode-<ts>", "chunk_text": ...}`. The field must stay `chunk_text`. The whole summary is stored as `"On <date>: <summary>"`, so recall brings back context, not a one-liner.
-- `retrieve_memories(query, top_k=5)` runs on every turn. Hits are prepended to the **user message**, never `messages[0]`; rewriting the system prompt invalidated Ollama's prefix cache (measured 13.8 s penalty).
+**Recall** (`retrieve_memories`), most detailed tier first, on every turn:
+1. **Chroma** (`memory_store.py`): an on-device vector store in `data/chroma`, with embeddings from Ollama's `nomic-embed-text`, using the `search_query:` / `search_document:` prefixes it was trained with.
+   - Records: `{text, kind: fact | session, date}`, with ids hashed from content, so re-adding is an upsert.
+   - Hits beyond `MAX_DISTANCE = 0.40` cosine distance are dropped. Measured: related questions land at 0.29–0.36, unrelated ones at 0.43–0.61. At 0.55, a coding preference leaked into the reply to "call me Captain".
+   - Hits come back tagged `(YYYY-MM-DD)`. Recall takes about 20–35 ms; Pinecone took 1–4 s.
+   - On first open the store is seeded from the vault (`obsidian_store.all_records()`), so it starts with what the notes hold.
+2. **Obsidian keyword search** (`obsidian_store.search`), if the store or the embedding model is unavailable: it scores sessions and topic lines by query-word overlap.
+
+Hits are prepended to the **user message**, never `messages[0]`; rewriting the system prompt invalidated Ollama's prefix cache (measured 13.8 s penalty).
+
+Pinecone was removed: its free tier ran out of monthly reads, and every failed recall cost 3–4 s. Memories written to it before the switch are still in that Pinecone account.
 
 **Obsidian** (the knowledge graph the user browses), vault default `~/Desktop/Jarvis AI`:
 - `Memory/YYYY-MM-DD.md`: `## Session (HH:MM) — <title>`, the summary, `### Facts learned`, then `### Topics` as `[[wikilinks]]`.
@@ -145,7 +176,16 @@ Rules that came from observed failures:
 - Days link to topics and topics link back to days, so the graph connects related sessions on its own.
 - A missing vault is skipped, never created.
 
-Pinecone and Obsidian fail independently; one failing is logged and doesn't stop the other.
+The vector store and Obsidian fail independently; one failing is logged and doesn't stop the other.
+
+### Preferences (preferences.py)
+Standing preferences the user states once and expects kept:
+- **Storage:** `data/preferences.json` on this Mac. It is mirrored to `<vault>/Memory/Preferences.md` for reading; the JSON is the source of truth.
+- **Known keys** change behaviour directly: `temperature_units` (the weather tools switch to metric), `home_location` (the default weather city, ahead of `JARVIS_HOME_LOCATION`) and `address_as` (replaces "sir" in acknowledgements and "not set up" replies). Anything else is a free-form note.
+- **Always visible:** `build_system_prompt()` includes `preferences.prompt_block()` at the start of every conversation.
+- **Two ways in:**
+  - Immediately, through the `PreferencesAgent` tools when the user says it ("I prefer Celsius" routes to the `preferences` group, statement or not).
+  - At session end, through a `preferences` field in the memory extraction, for anything the tool path missed. Only explicitly stated preferences are taken; "a place the user is travelling to is not their home".
 
 ---
 
@@ -158,9 +198,9 @@ Pinecone and Obsidian fail independently; one failing is logged and doesn't stop
 | `llama3.2:1b` | Tool-group fallback when no keyword matches | Ollama (local) |
 | `mlx-community/whisper-small-mlx` | Speech-to-text | MLX (Apple Silicon) |
 | `hexgrad/Kokoro-82M` (voice `af_heart`) | Text-to-speech | Kokoro (local) |
-| `llama-text-embed-v2` | Memory embeddings | Pinecone hosted |
+| `nomic-embed-text` | Memory embeddings (768-d) | Ollama (local) |
 
-- Ollama `keep_alive` is `JARVIS_IDLE_UNLOAD_MINUTES + 5` minutes, not forever. `shutdown()` unloads the models explicitly (`generate(..., keep_alive=0)`), and the bound frees them even after a crash.
+- Ollama `keep_alive` is `JARVIS_IDLE_UNLOAD_MINUTES + 5` minutes, not forever. `shutdown()` unloads the models explicitly (`generate(..., keep_alive=0)`, and `embed(..., keep_alive=0)` for the embedding model), and the bound frees them even after a crash. `prewarm()` loads all three.
 - Spoken replies are capped with `GEN_OPTIONS = {"num_predict": 160}`.
 
 ### Wired Up but Inactive
@@ -173,7 +213,7 @@ Unused for cost reasons. Do not remove them: they are the target production audi
 
 ## Agent Classes (agents.py)
 
-45 tools across 6 agents. Every public bound method becomes a tool; methods starting with `_` are internal helpers.
+55 tools across 8 agents. Every public bound method becomes a tool; methods starting with `_` are internal helpers.
 
 | Class | Group | Tools | Service |
 |---|---|---|---|
@@ -183,11 +223,21 @@ Unused for cost reasons. Do not remove them: they are the target production audi
 | `SpotifyAgent` | music | `get_current_track`, `search_song_and_queue`, `create_playlist`, `add_song_to_playlist`, `recently_played`, `skip_song`, `previous_song`, `pause_song`, `resume_song`, `shuffle`, `set_volume` | Spotify (spotipy) |
 | `GmailAgent` | email | `send_email`, `search_email`, `get_unread_emails`, `get_email_by_id`, `reply_to_email`, `mark_as_read`, `mark_as_unread`, `trash_email`, `remove_email_from_trash`, `get_drafts`, `send_draft`, `get_sent_emails`, `get_sender_profile`, `get_all_labels` | Gmail API |
 | `RemindersAgent` | reminders | `get_reminder_lists`, `add_reminder`, `get_reminders`, `get_due_reminders`, `complete_reminder`, `delete_reminder`, `update_reminder`, `create_reminder_list` | macOS Reminders via JXA |
+| `EverydayToolsAgent` | everyday (+ calendar) | `get_current_time`, `resolve_date`, `days_between`, `find_contact`, `get_apple_calendar_events`, `search_notes`, `read_note` | parsedatetime, Contacts and Notes via JXA, Calendar via EventKit |
+| `PreferencesAgent` | preferences | `set_preference`, `forget_preference`, `list_preferences` | `preferences.py` |
+
+### Everyday Tools
+Read-only lookups Jarvis can use whenever he needs a detail:
+- **Dates:** `resolve_date` turns phrases into exact dates deterministically, using parsedatetime with fixes for phrases it gets wrong ("the day after tomorrow"). It never reports a time the user didn't say. For "next Friday" it names both candidate dates in a `note`, because the phrase is ambiguous.
+- **Contacts and Notes** use JXA through the shared `_run_jxa` helper, with user text passed as JSON argv. Each takes about 5 s, and the first use asks for Automation permission.
+- **Apple Calendar** uses EventKit, not Calendar scripting, which misses recurring events and is slow. It covers every account in the macOS Calendar app. macOS asks Jarvis.app for calendar access on first use; that needs `NSCalendarsFullAccessUsageDescription` in the Info.plist. A process without it, such as a terminal, is refused without a prompt.
+- `get_apple_calendar_events` is also listed under `Calendar_Agents` in `tool_catalog`, so Apple Calendar is offered alongside the Google tools for "what's on my calendar".
 
 ### Weather Locations
 Weather tools take a **place name** (`location`), not coordinates:
 - `_locate()` geocodes it with OpenWeather's geocoding API (same key) and caches the result.
-- `"home"`, `"here"` or `""` mean `JARVIS_HOME_LOCATION` from `.env`. If that isn't set, the tool returns an error asking which city.
+- `"home"`, `"here"` or `""` mean the `home_location` preference, then `JARVIS_HOME_LOCATION` from `.env`. If neither is set, the tool returns an error asking which city.
+- Units follow the `temperature_units` preference: imperial by default, metric for celsius.
 - Results carry the resolved `location` label. Forecast days are labelled with their date, plus "(today)" / "(tomorrow)".
 - `get_daily_forecast` always returns at least 3 days, because the model passes `days=1` for "tomorrow".
 
@@ -199,15 +249,17 @@ Every agent is optional. `start_agents()` walks `AGENT_REQUIREMENTS`, a list of 
 
 When a tool request routes to a disabled group, `handle_turn` speaks `not_set_up_reply()` ("Weather isn't set up yet, sir…") **before** the acknowledgement, instead of letting the model invent an answer. The reply avoids spelling out env var names, because Kokoro reads them letter by letter.
 
-With nothing configured at all, the voice pipeline, chat, Reminders and Obsidian memory still work.
+With nothing configured at all, the voice pipeline, chat, memory, Reminders, everyday tools and preferences still work.
 
 ### Adding a New Agent
 1. Define a class in `agents.py`. Docstrings and type hints become the tool description Ollama sees, so write them for the model.
 2. Add it to `AGENT_REQUIREMENTS` in `jarvis.py` with the env vars or files it needs.
-3. Add its class name to `GROUP_BY_CLASS` (startup raises if it's missing), its trigger words to `GROUP_KEYWORDS`, and its spoken name to `SERVICE_NAMES`.
-4. Tool names must be unique across all agents: `build_tool_registry()` raises on duplicates.
+3. Add its class name to `GROUP_BY_CLASS` (startup raises if it's missing), its trigger words to `GROUP_KEYWORDS` and its spoken name to `SERVICE_NAMES`.
+4. Add an entry to `tool_catalog.AGENT_TOOLS` with every public method: trigger `words`, a few `ack` phrases, and `needs` for tools that take an id from another. Most common reads go first. Startup raises if a method is missing.
+5. Tool names must be unique across all agents: `build_tool_registry()` raises on duplicates.
+6. To offer a method in a second group too, list it under that group's agent in `tool_catalog` as well.
 
-There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_TOOLS` are all derived from `AGENTS`.
+`TOOL_REGISTRY` and `ALL_TOOLS` are derived from `AGENTS`; `TOOL_GROUPS` from `AGENTS` and `tool_catalog`, checked against each other at startup.
 
 ---
 
@@ -227,22 +279,28 @@ There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_T
 - Responses are spoken: conversational prose only, with no markdown, bullets or headers.
 
 ### Microphone / Transcription Settings (mic.py)
-- Energy threshold `200`, fixed (`dynamic_energy_threshold = False`)
-- Pause threshold `0.8 s` (was 1.5 s; dead air is felt directly as latency)
-- `LISTEN_TIMEOUT = 10 s` of silence ends the conversation; phrase limit `45 s`
-- Returns 16 kHz float32 numpy arrays; Whisper takes them directly
-- Do not change these without testing: they affect latency and false triggers.
+A fixed energy threshold of 200 in a room whose background sat at about 270 meant 87% of silence counted as speech. Recording ran to the 45 s cap, Whisper transcribed the noise ("ʕᴗᴗᴗ…", "When my plane gets here"), and the conversation never ended. The defences, in order:
+1. **Room-fitted threshold:** `set_noise_floor()` takes the listener's measured noise floor and sets the threshold to `NOISE_MULTIPLIER` (2.5×) for the first command after the wake word. Follow-ups use `JARVIS_FOLLOW_UP_LOUDNESS` (default 4×), because they come without a wake word and a TV or other people would otherwise keep a conversation going. The minimum is 200. Standalone `python jarvis.py` measures the room with `calibrate()` instead.
+2. **Speech check:** every recording is run through Silero VAD (`wake_word.speech_seconds`). Under `MIN_SPEECH_SECONDS = 0.3` it returns `NOISE` and is never transcribed.
+3. **Transcript check:** `is_speech()` rejects transcripts that are mostly non-letters or Whisper's stock phrases for silence ("Thank you.", "you"). Two in a row end the conversation.
+
+Other settings:
+- Pause threshold `0.8 s` (was 1.5 s; dead air is felt directly as latency).
+- `LISTEN_TIMEOUT = 10 s` of silence ends the conversation; phrase limit `45 s`.
+- Recordings are returned as 16 kHz float32 numpy arrays, which Whisper takes directly.
 
 ### Message History
 - `messages` holds the current conversation only. `run_session` clears everything after `messages[0]` when a conversation ends.
-- The system prompt at `messages[0]` must stay byte-stable for prefix caching.
-- Cross-session memory comes only from Pinecone recall.
+- `messages[0]` is rebuilt by `build_system_prompt()` at the start of each conversation (today's date, preferences) and must stay byte-stable within it, for prefix caching.
+- Cross-session memory comes from recall (Chroma, then Obsidian) and from preferences.
 
 ### Auth & Permissions
 - **Google**: `get_google_creds()` is shared by Calendar and Gmail (calendar + gmail read/send/modify/labels scopes). `token.json` auto-refreshes; if refresh fails (Google revokes after 7 days in Testing mode), it opens a browser login. That blocks the background app, so complete logins by running `python jarvis.py` in a terminal. `credentials.json` must be at the project root.
 - **Spotify**: token at `.spotify_token`; the first run needs a browser login in a terminal. Playback commands need an active Spotify device.
-- **Microphone**: macOS asks the first time Jarvis.app opens the mic (`NSMicrophoneUsageDescription`). The ad-hoc code signature keeps the grant across rebuilds.
-- **Reminders**: needs Automation permission under System Settings → Privacy & Security → Automation. User text is passed as JSON argv, never concatenated into the script.
+- **Spotify** also requires Spotify Premium on the account that owns the developer app. Without it, every request returns 403 "Active premium subscription required", and the agent starts with no connection.
+- **Microphone**: macOS asks the first time Jarvis.app opens the mic (`NSMicrophoneUsageDescription`). The ad-hoc code signature keeps the grant across rebuilds; verified.
+- **Calendars and Contacts**: `NSCalendarsFullAccessUsageDescription`, `NSCalendarsUsageDescription` and `NSContactsUsageDescription` are in the Info.plist, so macOS asks Jarvis.app on first use instead of refusing silently.
+- **Reminders, Contacts, Notes (JXA)**: each needs Automation permission under System Settings → Privacy & Security → Automation. User text is passed as JSON argv, never concatenated into the script.
 
 ---
 
@@ -252,7 +310,6 @@ There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_T
 
 | Key | Turns on | Source |
 |---|---|---|
-| `PINECONE_API_KEY` | Memory recall (without it, Obsidian notes only) | app.pinecone.io |
 | `OPENWEATHER_API_KEY` | Weather (needs the One Call 3.0 subscription) | home.openweathermap.org |
 | `TAVILY_API_KEY` | Web search and research | app.tavily.com |
 | `SPOTIPY_CLIENT_ID`, `SPOTIPY_CLIENT_SECRET`, `SPOTIPY_REDIRECT_URI` | Spotify (the redirect URI uses `127.0.0.1`, not `localhost`) | developer.spotify.com/dashboard |
@@ -261,6 +318,7 @@ There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_T
 | `OBSIDIAN_VAULT_PATH` | Vault location, default `~/Desktop/Jarvis AI` | |
 | `JARVIS_IDLE_UNLOAD_MINUTES` | How long the engine stays warm, default 10 | |
 | `JARVIS_WAKE_THRESHOLD` | Wake sensitivity, default 0.5; raise it if Jarvis triggers falsely | |
+| `JARVIS_FOLLOW_UP_LOUDNESS` | How much louder than the room a follow-up must be, default 4; raise it if background voices keep conversations going | |
 
 Calendar and Gmail need `credentials.json` (a Google Cloud OAuth desktop client) in the project folder instead of a key.
 
@@ -271,14 +329,18 @@ Calendar and Gmail need `credentials.json` (a Google Cloud OAuth desktop client)
 ```bash
 python tests.py              # everything except the microphone test
 python tests.py --quick      # structural checks only, no model calls
-python tests.py intent       # intent routing on 29 labelled phrases (needs Ollama)
-python tests.py wake memory  # wake word + Obsidian notes; need no API keys, Ollama or jarvis.py
+python tests.py intent       # intent routing on 35 labelled phrases (needs Ollama)
+python tests.py wake memory prefs everyday   # need no API keys, Ollama or jarvis.py
+python tests.py recall       # vector memory in a temp folder (needs Ollama)
+python status.py             # is the running Jarvis healthy?
 python tests.py voice        # interactive microphone check
 python tests.py --list       # show suite names
 ```
 
 - Tool suites check which tool the model **chooses** and never execute it, so they are safe against live accounts.
 - The wake suite synthesises speech with macOS `say`, so it needs no fixtures or microphone.
+- The memory, prefs and recall suites use temporary folders and never touch the real vault, `data/` or preferences.
+- **Tests with the real app write real memories.** Playing "Hey Jarvis" through the speakers runs a full conversation, and its summary lands in the vault and `data/chroma`. Remove those afterwards.
 - `jarvis.py` is guarded by `if __name__ == "__main__"` so tests can import it.
 
 ---
@@ -295,16 +357,16 @@ python tests.py --list       # show suite names
 
 ### Claude Code generates
 - Boilerplate method scaffolding inside new agent classes
-- `GROUP_BY_CLASS` and `GROUP_KEYWORDS` entries when adding new agents
+- `AGENT_REQUIREMENTS`, `GROUP_BY_CLASS`, `GROUP_KEYWORDS`, `SERVICE_NAMES` and `tool_catalog.AGENT_TOOLS` entries when adding new agents
 - Helper/utility functions (formatters, parsers, error handlers)
 - New agent class shells following the existing pattern
 
 ---
 
 ## Known Limitations
-- **Relative dates in conversation are unreliable.** "Remind me Friday" resolves correctly in tool calls (tested). But in chat, qwen2.5:7b turned "next Friday" (from Tuesday September 29) into September 30 and later October 6, and memory extraction then records the wrong date. It needs deterministic date parsing or a stronger model.
-- **The chat path can promise things it can't do**: "I've marked your flight", or "I'll use Celsius from now on" (weather units are fixed to imperial), because no tools are offered there.
-- **Pinecone's free tier can run out.** When recall hits a quota or rate limit, it pauses for an hour (`RECALL_PAUSE_SECONDS`) instead of spending 3–4 s of client retries on every turn. Writes use a separate quota.
+- **The chat path can claim actions it didn't take.** Observed: "I've noted this in your calendar and will remind you" with no tool called, because no tools are offered there.
+- **Dates in plain chat still depend on qwen.** Date questions route to `resolve_date` and are exact. But a date mentioned in passing in chat, and then in memory, can still be wrong.
+- **Background voices** (TV, other people) pass the speech check. The louder follow-up bar holds them off, but not a loud TV next to the Mac. `JARVIS_FOLLOW_UP_LOUDNESS` is the knob.
 - One remaining intent miss in the test set: "Can you help me write a poem about rain?" routes to weather.
 - One tool pass per command: tool A's output cannot feed tool B.
 - `messages` grows unbounded within a conversation, and the summarise instruction stays in history.
@@ -313,8 +375,8 @@ python tests.py --list       # show suite names
 - The app bakes in the project and `.venv` paths; re-run `build_app.sh` after moving either.
 
 ## Roadmap (mirrors PROGRESS.md)
-1. **Dates and honest chat**: deterministic parsing of relative dates, and keep the chat path from promising actions it can't take.
-2. **Multi-step agent loop**: keep calling tools until the model stops, with a cap, so results can chain.
+1. **Honest chat and a multi-step loop**: keep the chat path from claiming actions it didn't take, and let tool results chain.
+2. **Proactive help from the everyday tools**: check the calendar and contacts before scheduling or emailing, without being asked.
 3. **Memory upgrades**: "last time we spoke" context at session start, recency-weighted recall, history trimming.
 4. **Platform features**: restore ComputerControlAgent (macOS app/file control, recoverable from commit `3027c57`), menu-bar status icon, start at login, ElevenLabs voice for the final release.
 
@@ -332,6 +394,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 # Ollama must be running with these models pulled
 ollama pull qwen2.5:7b
 ollama pull llama3.2:1b
+ollama pull nomic-embed-text
 
 # First run in a terminal: completes the Google and Spotify logins, one conversation, no wake word
 .venv/bin/python jarvis.py
@@ -339,7 +402,7 @@ ollama pull llama3.2:1b
 # Background assistant with wake word, in the foreground for debugging
 .venv/bin/python wake_listener.py
 
-# Or install the app (Launchpad / Spotlight / Applications)
+# Or install the apps (Launchpad / Spotlight / Applications)
 bash build_app.sh
 ```
-Logs: `logs/jarvis.log` (rotated at 5 MB). Stop: `pkill -f wake_listener.py`.
+Check: open **Jarvis Status**, or run `.venv/bin/python status.py`. Logs: `logs/jarvis.log` (rotated at 5 MB). Stop: `pkill -f wake_listener.py`.

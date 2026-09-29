@@ -1,5 +1,6 @@
 # Jarvis — local-first voice assistant for Apple Silicon
-# Also requires Ollama running locally with qwen2.5:7b and llama3.2:1b pulled.
+# Also requires Ollama running locally with qwen2.5:7b, llama3.2:1b and
+# nomic-embed-text pulled, and Python 3.12 (Kokoro does not support 3.13+).
 
 # Wake word (wake_word.py runs the openwakeword models directly on onnxruntime)
 openwakeword
@@ -13,12 +14,18 @@ kokoro
 sounddevice
 numpy
 
-# Reasoning and memory
+# Reasoning and memory (on-device: Chroma with Ollama embeddings)
 ollama
-pinecone
+chromadb
+
+# Everyday tools
+parsedatetime
+pyobjc-framework-EventKit   # Apple Calendar (EventKit handles recurring events)
+pyobjc-framework-Cocoa      # Foundation (NSDate) for the EventKit calls
 
 # Agents
 google-api-python-client
+google-auth                 # imported directly (google.auth, google.oauth2)
 google-auth-oauthlib
 spotipy
 tavily-python

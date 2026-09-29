@@ -14,6 +14,9 @@ venv/
 # Runtime and build output
 logs/
 build/
+
+# Personal data kept on this Mac: vector memory and preferences
+data/
 .cache
 
 # Local audio and voice models
