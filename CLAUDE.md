@@ -81,7 +81,7 @@ classify_intent() [llama3.2:1b]  ║  retrieve_memories() [Pinecone]    ← run 
    ┌────────────────┼────────────────┐
  exit              tool             chat
    ↓                ↓                ↓
-streamed      "Right away sir."   qwen2.5:7b
+streamed      acknowledgement()   qwen2.5:7b
 farewell      select_tools()      streamed reply
               → tool call
               → summarise
@@ -90,10 +90,16 @@ speak_stream() → say() → speaker thread → Kokoro → sounddevice → chime
 ```
 
 ### Intent Classification
-`classify_intent()` uses `llama3.2:1b` (4 tokens max) to return one of:
+`classify_intent()` uses `qwen2.5:7b` with worked examples (`INTENT_PROMPT`, temperature 0, 3 tokens) to return one of:
 - **`exit`**: the user is ending the conversation → streamed farewell, then `run_session` ends it
 - **`tool`**: needs real-world action or data → tool routing and a tool call
 - **`chat`**: general conversation → streamed `qwen2.5:7b` reply, no tools
+
+`decide_intent(text, classified)` then applies two guards:
+- A **request** (`looks_like_request()`: a `?`, a command verb up front, or an embedded "remind me" / "can you") whose keywords point at a lookup group (`LOOKUP_GROUPS`: weather, calendar, email, reminders, web) becomes `tool` even if the classifier said `chat`. Music is excluded, because "skip" and "play" turn up in ordinary talk.
+- A **statement** is never `tool`. Offered calendar tools for "my sister's birthday is next week", the model may create an event nobody asked for.
+
+Measured on the 29 labelled phrases in `tests.py` (`INTENT_CASES`): the old `llama3.2:1b` classifier scored 13/29 and never recognised a goodbye; the qwen classifier plus the guards score 28/29, for about 170 ms more per turn. Run `python tests.py intent` after changing either.
 
 ### Tool Routing (intent == 'tool')
 Sending all 45 tool schemas costs about 3,600 prompt tokens and makes qwen2.5:7b ignore tools. `select_tools()` narrows the set:
@@ -101,15 +107,18 @@ Sending all 45 tool schemas costs about 3,600 prompt tokens and makes qwen2.5:7b
 2. `classify_tool_group()`: `llama3.2:1b` picks a group if no keyword matched
 3. Fallback: `ALL_TOOLS`
 
-If the routed group yields no tool call, the call is retried once with `ALL_TOOLS`.
+If the routed group yields no tool call:
+1. **`DEFAULT_CALLS`**: if the text is a request and the group has an obvious action, Jarvis runs it itself. Weather runs `get_current_weather(location="home")`; music turns "play X" into `search_song_and_queue(query=X)`. This exists because qwen2.5:7b narrates ("I'll check the weather at home…") or declines "play some jazz", even at temperature 0.
+2. Otherwise, the call is retried once with `ALL_TOOLS`.
 
 ### Tool Execution
 1. Prefix the user message with `date_reference()`: today's date and the named dates of the coming week (qwen gets weekdays wrong from an ISO date alone). The chat path gets the same prefix. Both use a copy of the last message, so the stored history, and the prompt cache, are unchanged.
-2. Call `qwen2.5:7b` with the selected tools.
-3. Execute each `tool_call` via `TOOL_REGISTRY[name](**args)`. Exceptions become a text result instead of crashing.
-4. Append results as `role: tool` messages with `tool_name` (Ollama format).
-5. Ask for a two-sentence summary **with the same tools list**. This keeps Ollama's KV cache prefix; a different prefix cost 13.5 s on the next command.
-6. Stream the summary to speech.
+2. Speak `acknowledgement(group)`, a short phrase fitting the group ("Let me check your calendar.", "Pulling up the forecast."), never the same one twice in a row. It is queued, so it plays over the model call. A disabled group gets `not_set_up_reply()` instead.
+3. Call `qwen2.5:7b` with the selected tools.
+4. Execute each `tool_call` via `TOOL_REGISTRY[name](**args)`. Exceptions become a text result instead of crashing.
+5. Append results as `role: tool` messages with `tool_name` (Ollama format).
+6. Ask for a two-sentence summary **with the same tools list**. This keeps Ollama's KV cache prefix; a different prefix cost 13.5 s on the next command.
+7. Stream the summary to speech.
 
 ### Memory System
 Each session is saved once it ends, on a background thread (`remember_in_background`). The thread is non-daemon and tracked, so `shutdown()` / `flush_memories()` wait for it.
@@ -145,8 +154,8 @@ Pinecone and Obsidian fail independently; one failing is logged and doesn't stop
 | Model | Purpose | Runtime |
 |---|---|---|
 | `hey_jarvis_v0.1` + melspectrogram, embedding, Silero VAD | Wake word | onnxruntime (listener process) |
-| `qwen2.5:7b` | Reasoning, tool calling, summarisation, memory extraction | Ollama (local) |
-| `llama3.2:1b` | Intent classification + tool-group fallback | Ollama (local) |
+| `qwen2.5:7b` | Intent classification, reasoning, tool calling, summarisation, memory extraction | Ollama (local) |
+| `llama3.2:1b` | Tool-group fallback when no keyword matches | Ollama (local) |
 | `mlx-community/whisper-small-mlx` | Speech-to-text | MLX (Apple Silicon) |
 | `hexgrad/Kokoro-82M` (voice `af_heart`) | Text-to-speech | Kokoro (local) |
 | `llama-text-embed-v2` | Memory embeddings | Pinecone hosted |
@@ -170,10 +179,17 @@ Unused for cost reasons. Do not remove them: they are the target production audi
 |---|---|---|---|
 | `Calendar_Agents` | calendar | `create_event`, `get_calendar_events`, `update_calendar_event`, `delete_calendar_event` | Google Calendar API |
 | `WebSearchAgents` | web | `search_web`, `extract_webpages`, `crawl_webpages`, `research` | Tavily |
-| `WeatherSearch` | weather | `get_current_weather`, `get_weather_with_time`, `get_daily_forecast`, `get_weather_alerts` | OpenWeatherMap One Call 3.0 |
+| `WeatherSearch` | weather | `get_current_weather`, `get_weather_with_time`, `get_daily_forecast`, `get_weather_alerts` | OpenWeatherMap One Call 3.0 + Geocoding |
 | `SpotifyAgent` | music | `get_current_track`, `search_song_and_queue`, `create_playlist`, `add_song_to_playlist`, `recently_played`, `skip_song`, `previous_song`, `pause_song`, `resume_song`, `shuffle`, `set_volume` | Spotify (spotipy) |
 | `GmailAgent` | email | `send_email`, `search_email`, `get_unread_emails`, `get_email_by_id`, `reply_to_email`, `mark_as_read`, `mark_as_unread`, `trash_email`, `remove_email_from_trash`, `get_drafts`, `send_draft`, `get_sent_emails`, `get_sender_profile`, `get_all_labels` | Gmail API |
 | `RemindersAgent` | reminders | `get_reminder_lists`, `add_reminder`, `get_reminders`, `get_due_reminders`, `complete_reminder`, `delete_reminder`, `update_reminder`, `create_reminder_list` | macOS Reminders via JXA |
+
+### Weather Locations
+Weather tools take a **place name** (`location`), not coordinates:
+- `_locate()` geocodes it with OpenWeather's geocoding API (same key) and caches the result.
+- `"home"`, `"here"` or `""` mean `JARVIS_HOME_LOCATION` from `.env`. If that isn't set, the tool returns an error asking which city.
+- Results carry the resolved `location` label. Forecast days are labelled with their date, plus "(today)" / "(tomorrow)".
+- `get_daily_forecast` always returns at least 3 days, because the model passes `days=1` for "tomorrow".
 
 ### Optional Services
 Every agent is optional. `start_agents()` walks `AGENT_REQUIREMENTS`, a list of `(class, [env vars or *.json files])` pairs:
@@ -181,7 +197,7 @@ Every agent is optional. `start_agents()` walks `AGENT_REQUIREMENTS`, a list of 
 - An agent whose constructor raises is left out too, and the rest still start.
 - The reason is recorded in `DISABLED_AGENTS` by class and `DISABLED_GROUPS` by group.
 
-When a tool request routes to a disabled group, `handle_turn` speaks `not_set_up_reply()` ("Weather isn't set up yet, sir…") **before** "Right away sir", instead of letting the model invent an answer. The reply avoids spelling out env var names, because Kokoro reads them letter by letter.
+When a tool request routes to a disabled group, `handle_turn` speaks `not_set_up_reply()` ("Weather isn't set up yet, sir…") **before** the acknowledgement, instead of letting the model invent an answer. The reply avoids spelling out env var names, because Kokoro reads them letter by letter.
 
 With nothing configured at all, the voice pipeline, chat, Reminders and Obsidian memory still work.
 
@@ -241,6 +257,7 @@ There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_T
 | `TAVILY_API_KEY` | Web search and research | app.tavily.com |
 | `SPOTIPY_CLIENT_ID`, `SPOTIPY_CLIENT_SECRET`, `SPOTIPY_REDIRECT_URI` | Spotify (the redirect URI uses `127.0.0.1`, not `localhost`) | developer.spotify.com/dashboard |
 | `ELEVENLABS_API_KEY` | Nothing yet; reserved for final release | elevenlabs.io |
+| `JARVIS_HOME_LOCATION` | City used when a weather question names no place, e.g. `Boston` | |
 | `OBSIDIAN_VAULT_PATH` | Vault location, default `~/Desktop/Jarvis AI` | |
 | `JARVIS_IDLE_UNLOAD_MINUTES` | How long the engine stays warm, default 10 | |
 | `JARVIS_WAKE_THRESHOLD` | Wake sensitivity, default 0.5; raise it if Jarvis triggers falsely | |
@@ -254,6 +271,7 @@ Calendar and Gmail need `credentials.json` (a Google Cloud OAuth desktop client)
 ```bash
 python tests.py              # everything except the microphone test
 python tests.py --quick      # structural checks only, no model calls
+python tests.py intent       # intent routing on 29 labelled phrases (needs Ollama)
 python tests.py wake memory  # wake word + Obsidian notes; need no API keys, Ollama or jarvis.py
 python tests.py voice        # interactive microphone check
 python tests.py --list       # show suite names
@@ -284,18 +302,18 @@ python tests.py --list       # show suite names
 ---
 
 ## Known Limitations
-- **Intent misrouting causes made-up answers.** `llama3.2:1b` sometimes classifies a live-data question as `chat` (observed: "what's the weather in Boston"), and qwen then invents an answer instead of calling a tool. Statements that mention a tool topic can also be routed as `tool`.
-- **Dates are unreliable.** Even with `date_reference()` listing named dates, qwen2.5:7b turned "next Friday" (from Tuesday September 29) into September 30 and later October 6. Memory extraction then records Jarvis's wrong date. It needs deterministic date parsing or a stronger model.
-- The chat path can claim actions it didn't take ("I've marked your flight"), because no tools are offered there.
+- **Relative dates in conversation are unreliable.** "Remind me Friday" resolves correctly in tool calls (tested). But in chat, qwen2.5:7b turned "next Friday" (from Tuesday September 29) into September 30 and later October 6, and memory extraction then records the wrong date. It needs deterministic date parsing or a stronger model.
+- **The chat path can promise things it can't do**: "I've marked your flight", or "I'll use Celsius from now on" (weather units are fixed to imperial), because no tools are offered there.
+- **Pinecone's free tier can run out.** When recall hits a quota or rate limit, it pauses for an hour (`RECALL_PAUSE_SECONDS`) instead of spending 3–4 s of client retries on every turn. Writes use a separate quota.
+- One remaining intent miss in the test set: "Can you help me write a poem about rain?" routes to weather.
 - One tool pass per command: tool A's output cannot feed tool B.
 - `messages` grows unbounded within a conversation, and the summarise instruction stays in history.
-- Weather tools need latitude/longitude and there is no geocoding tool, so the model guesses coordinates.
 - The all-tools retry also fires when the model correctly answers without a tool.
 - A cold wake (engine retired) takes about 6 s before the first answer starts. The command itself is recorded during that time.
 - The app bakes in the project and `.venv` paths; re-run `build_app.sh` after moving either.
 
 ## Roadmap (mirrors PROGRESS.md)
-1. **Harden intent routing and dates**: keyword routing before the classifier, so live-data questions always reach a tool, and deterministic parsing of relative dates.
+1. **Dates and honest chat**: deterministic parsing of relative dates, and keep the chat path from promising actions it can't take.
 2. **Multi-step agent loop**: keep calling tools until the model stops, with a cap, so results can chain.
 3. **Memory upgrades**: "last time we spoke" context at session start, recency-weighted recall, history trimming.
 4. **Platform features**: restore ComputerControlAgent (macOS app/file control, recoverable from commit `3027c57`), menu-bar status icon, start at login, ElevenLabs voice for the final release.

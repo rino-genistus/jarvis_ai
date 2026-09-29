@@ -268,65 +268,127 @@ class WebSearchAgents():
             return f"Could not complete the research: {e}"
 
 class WeatherSearch():
-    def get_current_weather(self, latitude: float, longitude: float, exclude: list[str] = None):
+    """
+    Every tool takes a place name, not coordinates. Asked for coordinates, the
+    model had to recall Boston's latitude from memory — it's resolved here with
+    OpenWeather's geocoding API instead, using the same key.
+    """
+
+    ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
+    GEOCODE_URL = "https://api.openweathermap.org/geo/1.0/direct"
+    # What the model passes when the user names no place
+    HOME_WORDS = {"home", "here", "my location", "current location", "local"}
+
+    def __init__(self):
+        self._places = {}   # geocoding cache: a city doesn't move between questions
+
+    def _locate(self, location: str):
         """
-        Get the current weather for a location using its coordinates.
-        Use this for any question about current conditions, temperature, humidity or wind.
+        Internal helper. Turns a place name into (lat, lon, label). 'home' (or an
+        empty string) means the user's home, JARVIS_HOME_LOCATION in .env.
+        Raises ValueError with a message worth speaking.
+        """
+        location = (location or "").strip()
+        if location.lower() in self.HOME_WORDS:
+            location = ""
+        location = location or os.getenv("JARVIS_HOME_LOCATION", "").strip()
+        if not location:
+            raise ValueError("No location given and no home location is set. Ask the user which city.")
+        key = location.lower()
+        if key not in self._places:
+            response = requests.get(self.GEOCODE_URL, timeout=10, params={
+                "q": location, "limit": 1, "appid": os.getenv("OPENWEATHER_API_KEY")})
+            results = response.json()
+            if not isinstance(results, list) or not results:
+                raise ValueError(f"Could not find a place called {location!r}.")
+            place = results[0]
+            label = ", ".join(p for p in (place.get("name"), place.get("state"), place.get("country")) if p)
+            self._places[key] = (place["lat"], place["lon"], label)
+        return self._places[key]
+
+    def _onecall(self, location: str, exclude: str):
+        """Internal helper. One Call 3.0 for a place; returns (data, label)."""
+        lat, lon, label = self._locate(location)
+        response = requests.get(self.ONECALL_URL, timeout=10, params={
+            "lat": lat, "lon": lon, "exclude": exclude, "units": "imperial",
+            "appid": os.getenv("OPENWEATHER_API_KEY")})
+        data = response.json()
+        if response.status_code != 200:
+            # e.g. 401 when the One Call 3.0 subscription isn't active on the key
+            raise ValueError(f"OpenWeather error: {data.get('message', response.status_code)}")
+        return data, label
+
+    def get_current_weather(self, location: str):
+        """
+        Get the current weather for a place, e.g. location='Boston' or 'Paris, France'.
+        If the user names no place, use location='home'. Never ask the user where they
+        are. Use this for any question about current conditions, temperature, humidity or wind.
         For multi-day questions use get_daily_forecast instead.
         """
-        # Default trims the noisy blocks — minutely alone is 60 entries of rainfall
-        if exclude is None:
-            exclude = ["minutely", "hourly", "daily"]
-        exclude_str = ",".join(exclude) if exclude else ""
-        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&exclude={exclude_str}&units=imperial&appid={os.getenv('OPENWEATHER_API_KEY')}")
-        return response.json()
-    def get_weather_with_time(self, latitude: float, longitude: float, target_hour: str):
+        # Excludes the noisy blocks — minutely alone is 60 entries of rainfall
+        data, label = self._onecall(location, "minutely,hourly,daily")
+        return {"location": label, "units": "fahrenheit, mph", "current": data.get("current", {}),
+                "alerts": data.get("alerts", [])}
+
+    def get_weather_with_time(self, location: str, target_hour: str):
         """
-        Get the hourly weather forecast for a specific hour today.
+        Get the hourly weather forecast for a specific hour today at a place.
         Use this when the user asks about weather at a specific time,
         e.g. 'what will the weather be at 10pm tonight'.
         target_hour should be in 24-hour format (0-23) in the location's local time.
+        If the user names no place, use location='home'.
         """
-        params = f"lat={latitude}&lon={longitude}&units=imperial&exclude=current,minutely,daily,alerts&appid={os.getenv('OPENWEATHER_API_KEY')}"
-        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?{params}")
-        data = response.json()
-
+        data, label = self._onecall(location, "current,minutely,daily,alerts")
         timezone_offset = data.get("timezone_offset", 0)  # seconds offset from UTC
         hourly = data.get("hourly", [])
 
+        match = hourly[0] if hourly else {}
         for hour in hourly:
             local_dt = datetime.datetime.utcfromtimestamp(hour["dt"] + timezone_offset)
             if local_dt.hour == int(target_hour):
-                return hour
+                match = hour
+                break
+        if match:
+            match = {"time": self._local_label(match["dt"], timezone_offset, "%A %H:%M"), **match}
+        return {"location": label, "units": "fahrenheit, mph", "hour": match}
 
-        return hourly[0] if hourly else {}
-    def get_daily_forecast(self, latitude: float, longitude: float, days: int = 7):
+    def get_daily_forecast(self, location: str, days: int = 7):
         """
-        Get the daily weather forecast for the next N days (max 8).
-        Use this when the user asks about weather over multiple days,
-        a specific day this week, or a general weekly forecast.
-        days should be between 1 and 8.
+        Get the daily weather forecast for a place for the next N days (max 8).
+        Use this when the user asks about weather over multiple days, tomorrow,
+        a specific day this week, or a general weekly forecast. Each day is labelled
+        with its date. If the user names no place, use location='home'.
         """
-        params = f"lat={latitude}&lon={longitude}&units=imperial&exclude=current,minutely,hourly,alerts&appid={os.getenv('OPENWEATHER_API_KEY')}"
-        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?{params}")
-        data = response.json()
+        data, label = self._onecall(location, "current,minutely,hourly,alerts")
+        offset = data.get("timezone_offset", 0)
+        # At least three days: asked about "tomorrow", the model tends to pass
+        # days=1 and get only today. The date labels let it pick the right one.
+        days = max(3, min(int(days), 8))
+        daily = [{"date": self._local_label(day["dt"], offset, "%A %Y-%m-%d"), **day}
+                 for day in data.get("daily", [])[:days]]
+        if daily:
+            daily[0]["date"] += " (today)"
+        if len(daily) > 1:
+            daily[1]["date"] += " (tomorrow)"
+        return {"location": label, "units": "fahrenheit, mph", "daily": daily}
 
-        daily = data.get("daily", [])
-        return daily[:days]
+    @staticmethod
+    def _local_label(timestamp, offset, fmt):
+        """Internal helper. A forecast timestamp as a readable local date/time."""
+        return datetime.datetime.utcfromtimestamp(timestamp + offset).strftime(fmt)
 
-    def get_weather_alerts(self, latitude: float, longitude: float,):
+    def get_weather_alerts(self, location: str):
         """
-        Get any active severe weather alerts for a location.
+        Get any active severe weather alerts for a place.
         Use this when the user asks about weather warnings, storms,
         advisories, or any severe weather in their area.
+        If the user names no place, use location='home'.
         """
-        response = requests.get(f"https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&units=imperial&appid={os.getenv('OPENWEATHER_API_KEY')}")
-        data = response.json()
+        data, label = self._onecall(location, "current,minutely,hourly,daily")
         alerts = data.get('alerts', [])
         if not alerts:
-            return "No active weather alerts for this location"
-        else:
-            return alerts
+            return f"No active weather alerts for {label}"
+        return {"location": label, "alerts": alerts}
 
 class SpotifyAgent():
 

@@ -396,12 +396,18 @@ def suite_tools():
                  messages=[{"role": "system", "content": j.system_prompt},
                            {"role": "user", "content": f"{date_context} {text}"}])
         called = [c.function.name for c in (r.message.tool_calls or [])]
+        via = ""
+        if not called and group in j.DEFAULT_CALLS and j.looks_like_request(text):
+            # What handle_turn does when the model declines: run the group's default
+            default = j.DEFAULT_CALLS[group](text)
+            if default:
+                called, via = [default[0]], " (handle_turn default)"
         ok = bool(set(called) & expected)
         correct += ok
         if not ok:
             misses.append((text, group, called))
         mark = "\033[32mok  \033[0m" if ok else "\033[31mmiss\033[0m"
-        print(f"        {mark} {text[:42]:44} [{group}] -> {called or 'NO TOOL CALL'}")
+        print(f"        {mark} {text[:42]:44} [{group}] -> {called or 'NO TOOL CALL'}{via}")
     check("model picks a sensible tool for each request", correct == len(cases),
           f"{correct}/{len(cases)}")
 
@@ -500,6 +506,52 @@ def suite_latency():
 
     for name, took, target in results:
         check(f"{name} within target", took <= target, f"{ms(took)} vs {ms(target)} target")
+
+
+INTENT_CASES = [
+    ("Thanks Jarvis, that'll be all.", "exit"), ("Goodbye.", "exit"), ("That's it for now, thanks.", "exit"),
+    ("I'm done, talk later.", "exit"), ("Okay, thank you, bye.", "exit"), ("Go to sleep.", "exit"),
+    ("What's the weather in Boston?", "tool"), ("How hot is it outside?", "tool"),
+    ("What's on my calendar tomorrow?", "tool"), ("Any unread emails?", "tool"),
+    ("Remind me to call mom on Friday.", "tool"), ("Play some jazz.", "tool"), ("Skip this song.", "tool"),
+    ("Search the web for the best pizza in Toronto.", "tool"),
+    ("Add a meeting with Sarah at 3pm tomorrow.", "tool"),
+    ("Send an email to John saying I'm running late.", "tool"),
+    ("What reminders do I have today?", "tool"), ("Pause the music.", "tool"),
+    ("Will it rain in Toronto tomorrow?", "tool"),
+    ("Tell me a joke.", "chat"), ("I skipped lunch today.", "chat"),
+    ("I prefer temperatures in Celsius, by the way.", "chat"), ("What's the capital of France?", "chat"),
+    ("Explain how a neural network works.", "chat"), ("My sister's birthday is next week.", "chat"),
+    ("I'm feeling tired today.", "chat"), ("Thanks, that's helpful.", "chat"),
+    ("Can you help me write a poem about rain?", "chat"), ("Interesting, tell me more.", "chat"),
+]
+
+
+def suite_intent():
+    """
+    Intent routing — classifier plus decide_intent() — on labelled phrases.
+    llama3.2:1b scored 13/29 here and never recognised a goodbye; the qwen
+    few-shot classifier with the guards scored 28/29.
+    """
+    header("intent")
+    j = load_jarvis()
+    wrong = []
+    for text, want in INTENT_CASES:
+        got = j.decide_intent(text, j.classify_intent(text))
+        if got != want:
+            wrong.append(f"{text!r} -> {got}")
+    score = len(INTENT_CASES) - len(wrong)
+    for w in wrong:
+        print(f"        miss: {w}")
+    check("intent routing on labelled phrases", score >= len(INTENT_CASES) - 2,
+          f"{score}/{len(INTENT_CASES)}")
+    exits = [t for t, w in INTENT_CASES if w == "exit"]
+    check("every goodbye ends the conversation",
+          all(j.decide_intent(t, j.classify_intent(t)) == "exit" for t in exits))
+    statements = ["I skipped lunch today.", "My sister's birthday is next week.",
+                  "I prefer temperatures in Celsius, by the way."]
+    check("statements never trigger tools",
+          all(j.decide_intent(t, "tool") != "tool" for t in statements))
 
 
 def suite_wake():
@@ -646,13 +698,14 @@ SUITES = {
     "cache": suite_cache,
     "tools": suite_tools,
     "latency": suite_latency,
+    "intent": suite_intent,
     "wake": suite_wake,
     "memory": suite_memory,
     "voice": suite_voice,
 }
 
 QUICK = ["imports", "registry", "routing", "text"]
-DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "latency", "wake", "memory"]
+DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "intent", "latency", "wake", "memory"]
 
 
 def main():

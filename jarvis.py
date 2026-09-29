@@ -4,7 +4,7 @@ from elevenlabs.play import play
 import os
 import speech_recognition as sr
 import mlx_whisper
-from ollama import chat, generate, ChatResponse
+from ollama import chat, generate, ChatResponse, Message
 import time
 from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent, RemindersAgent
 import mic
@@ -18,6 +18,7 @@ import threading
 import inspect
 import json
 import queue
+import random
 import re
 
 start_time = time.time()
@@ -195,7 +196,8 @@ SERVICE_NAMES = {"weather": "Weather", "calendar": "Google Calendar", "music": "
 # both faster and more reliable than asking a 1B model.
 GROUP_KEYWORDS = {
     "weather": ("weather", "forecast", "temperature", "raining", "rain", "snow",
-                "sunny", "humid", "wind", "how hot", "how cold", "degrees"),
+                "sunny", "humid", "wind", "how hot", "how cold", "degrees",
+                "storm", "hurricane", "tornado", "weather alert", "weather warning"),
     "reminders": ("remind", "reminder", "task list", "to-do", "todo", "don't let me forget"),
     "calendar": ("calendar", "schedule", "meeting", "appointment", "event", "am i free",
                  "what's on", "whats on", "book me"),
@@ -205,6 +207,59 @@ GROUP_KEYWORDS = {
     "web": ("search the web", "look up", "google", "search for", "find online",
             "latest news", "research"),
 }
+
+# Groups whose keywords are specific enough to overrule the intent classifier
+LOOKUP_GROUPS = {"weather", "calendar", "email", "reminders", "web"}
+
+REQUEST_OPENERS = {"what", "what's", "whats", "how", "is", "are", "will", "does", "do", "did",
+                   "any", "can", "could", "would", "should", "when", "where", "which", "who",
+                   "tell", "check", "give", "show", "find", "get", "look", "search", "read",
+                   "remind", "add", "create", "set", "schedule", "book", "send", "reply", "move",
+                   "cancel", "delete", "make", "put", "list", "email", "mark", "trash", "draft",
+                   "play", "pause", "resume", "skip", "stop", "shuffle", "queue", "turn", "next",
+                   "previous", "complete", "update", "change", "clear"}
+EMBEDDED_REQUEST = re.compile(r"\b(remind me|can you|could you|would you|please|i need you to|"
+                              r"i want you to|i'd like you to|let me know)\b")
+
+
+def looks_like_request(text):
+    """
+    True for questions and commands, false for statements. Whisper punctuates
+    reliably, so each sentence is checked: a '?', a command verb up front, or
+    an embedded ask ("...on Friday. Remind me.", "can you...").
+
+    "How hot is it outside?" and "Play some jazz." are requests; "I prefer
+    temperatures in Celsius." and "My sister's birthday is next week." are not.
+    """
+    lowered = text.strip().lower()
+    if EMBEDDED_REQUEST.search(lowered):
+        return True
+    for sentence in re.split(r"(?<=[.!?])\s+", lowered):
+        if sentence.endswith("?"):
+            return True
+        words = re.sub(r"^(hey |ok |okay |so |and |oh |jarvis,? |please )+", "", sentence).split()
+        if words and words[0].strip(",.!") in REQUEST_OPENERS:
+            return True
+    return False
+
+
+def decide_intent(text, classified):
+    """
+    Final intent from the classifier's answer plus two guards:
+
+    - A clear request whose keywords point at a lookup service is a tool call
+      even if the classifier said chat — otherwise qwen invents a forecast.
+      Music is left out: "skip", "play" and "track" turn up in ordinary talk.
+    - A statement is never a tool call. Offered calendar tools for "my
+      sister's birthday is next week", the model may create an event nobody
+      asked for.
+    """
+    if classified == "chat" and route_tools(text)[0] in LOOKUP_GROUPS and looks_like_request(text):
+        return "tool"
+    if classified == "tool" and not looks_like_request(text):
+        return "chat"
+    return classified
+
 
 def route_tools(text):
     """
@@ -622,44 +677,71 @@ def flush_memories():
     while _memory_threads:
         _memory_threads.pop().join()
 
+RECALL_PAUSE_SECONDS = 3600
+_recall_paused_until = 0.0
+
+
 def retrieve_memories(query: str, top_k: int = 5):
     """
     Retrieves most meaningful messages from Pinecone Vector DB for conversation context
     """
-    if dense_index is None:
+    global _recall_paused_until
+    if dense_index is None or time.time() < _recall_paused_until:
         return []
-    results = dense_index.search(
-        namespace="jarvis-memory-namespace",
-        query={"inputs": {"text": query}, "top_k": top_k},
-        fields=["chunk_text"]
-    )
+    try:
+        results = dense_index.search(
+            namespace="jarvis-memory-namespace",
+            query={"inputs": {"text": query}, "top_k": top_k},
+            fields=["chunk_text"]
+        )
+    except Exception as e:
+        # A quota or rate limit error takes the client 3-4s of retries to
+        # report, on every turn. Stop asking for an hour instead.
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "RateLimit" in type(e).__name__:
+            _recall_paused_until = time.time() + RECALL_PAUSE_SECONDS
+            print(f"Pinecone quota exceeded — memory recall paused for {RECALL_PAUSE_SECONDS // 60} minutes")
+        raise
     memories = [hit["fields"]["chunk_text"] for hit in results["result"]["hits"]]
     return memories
+
+INTENT_PROMPT = """Classify the user's message to a voice assistant. Reply with exactly one word: exit, tool, or chat.
+
+exit = the user is ending the conversation: goodbyes, "that's all", "I'm done", "go to sleep".
+tool = the user wants something done or looked up in their weather, calendar, email, reminders, music or the web.
+chat = everything else: questions answered from general knowledge, jokes, explanations, and statements or remarks about themselves.
+
+Examples:
+"Thanks, that'll be all." -> exit
+"Okay, bye." -> exit
+"Go to sleep." -> exit
+"What's on my calendar tomorrow?" -> tool
+"Remind me to buy milk." -> tool
+"Play some music." -> tool
+"Skip this track." -> tool
+"Is it cold outside?" -> tool
+"Tell me a joke." -> chat
+"What's the capital of Japan?" -> chat
+"I had a long day at work." -> chat
+"Thanks, that's helpful." -> chat
+
+Message: "{text}"
+Answer:"""
+
 
 def classify_intent(text):
     """
     Returns 'exit', 'tool', or 'chat'.
+
+    qwen2.5:7b with worked examples, not llama3.2:1b. On a fixed set of 29
+    labelled phrases the 1B model scored 13 — it never once recognised a
+    goodbye — while this scores 27 for about 170ms more per turn. qwen is
+    already resident, so there's no load cost. decide_intent() then guards it.
     """
-    response = chat(
-            model='llama3.2:1b',
-            keep_alive=OLLAMA_KEEP_ALIVE,
-            options={"num_predict": 4},
-            messages=[{"role": "user", "content":
-                    f"""Classify this message. Reply with exactly one word only: exit, tool, or chat.
-
-            exit = user wants to end the conversation
-            tool = user wants real-world action or data (weather, calendar, spotify, web search)
-            chat = general conversation or questions
-
-            Message: "{text}"
-
-            One word answer:"""}]
-    )
-    result = response.message.content.strip().lower()
-    first_word = result.split()[0] if result else "chat"
-    if first_word not in ("exit", "tool", "chat"):
-        return "chat"
-    return first_word
+    response = chat(model='qwen2.5:7b', keep_alive=OLLAMA_KEEP_ALIVE,
+                    options={"num_predict": 3, "temperature": 0},
+                    messages=[{"role": "user", "content": INTENT_PROMPT.format(text=text)}])
+    word = (response.message.content.strip().lower().split() or ["chat"])[0].strip(".,\"'")
+    return word if word in ("exit", "tool", "chat") else "chat"
 
 
 def classify_tool_group(text):
@@ -738,6 +820,46 @@ def select_tools(text):
     return group, tools
 
 
+# Spoken the moment a tool request starts, over the model call. Phrased to fit
+# both reading ("what's on my calendar") and doing ("add a meeting"), and to
+# name the thing being checked, so it sounds like an assistant getting on with
+# it rather than a canned "Right away sir".
+ACKNOWLEDGEMENTS = {
+    "weather": ["Let me check the weather.", "Pulling up the forecast.", "One moment, checking outside."],
+    "calendar": ["Let me check your calendar.", "Pulling up your schedule.", "One moment, looking at your calendar."],
+    "email": ["Let me check your inbox.", "Pulling up your email.", "One moment, going through your mail."],
+    "music": ["On it.", "Sure thing.", "One moment."],
+    "reminders": ["Let me get that sorted.", "On it, sir.", "One moment, opening your reminders."],
+    "web": ["Let me look that up.", "Searching now.", "Give me a moment to dig into that."],
+    "ALL": ["On it.", "Let me take care of that.", "One moment, sir."],
+}
+_last_acknowledgement = None
+
+def _default_music_call(text):
+    """'Play some jazz' -> queue a search for 'jazz'. Anything else has no safe default."""
+    match = re.match(r"^(?:hey |ok |okay |jarvis,? |please )*play (?:me |some |a little |a bit of |the song )*(.+?)[.!?]*$",
+                     text.strip(), re.IGNORECASE)
+    return ("search_song_and_queue", {"query": match.group(1)}) if match else None
+
+
+# What to run when a request clearly belongs to a group but the model makes no
+# tool call — qwen2.5:7b narrates "I'll check the weather at home..." or
+# declines "play some jazz" outright, even at temperature 0. Each entry maps
+# the utterance to (tool, args), or None when there's no obvious action.
+DEFAULT_CALLS = {
+    "weather": lambda text: ("get_current_weather", {"location": "home"}),
+    "music": _default_music_call,
+}
+
+
+def acknowledgement(group):
+    """A short, varied phrase for starting a task — never the same one twice running."""
+    global _last_acknowledgement
+    options = [p for p in ACKNOWLEDGEMENTS.get(group, ACKNOWLEDGEMENTS["ALL"]) if p != _last_acknowledgement]
+    _last_acknowledgement = random.choice(options)
+    return _last_acknowledgement
+
+
 def not_set_up_reply(group):
     """Spoken when a request routes to an agent that is switched off."""
     # Kept speakable: Kokoro reading out OPENWEATHER_API_KEY letter by letter helps nobody
@@ -779,6 +901,11 @@ def handle_turn(transcribed_text, transcript):
 
     intent = parallel.get("intent", "chat")
     memories = parallel.get("memories", [])
+
+    decided = decide_intent(transcribed_text, intent)
+    if decided != intent:
+        print(f"Intent override: {intent} -> {decided}")
+        intent = decided
     print(f"Intent: {intent}  (routing took {time.time() - turn_start:.2f}s)")
 
     user_content = transcribed_text
@@ -804,7 +931,7 @@ def handle_turn(transcribed_text, transcript):
     elif intent == 'tool':
         #Needs tool usage
         group, tools = select_tools(transcribed_text)
-        # Checked before "Right away sir" — promising action and then saying
+        # Checked before the acknowledgement — promising action and then saying
         # the service is off would be worse than just saying so.
         if group in DISABLED_GROUPS:
             spoken = not_set_up_reply(group)
@@ -815,8 +942,8 @@ def handle_turn(transcribed_text, transcript):
             chime()
             return False
         # Queued, not blocking — this plays over the model call instead of
-        # delaying it by the 2.2s it takes to speak.
-        say("Right away sir.")
+        # delaying it by the time it takes to speak.
+        say(acknowledgement(group))
         print(f"Tool group: {group} ({len(tools)} tools)")
 
         date_context = f"[{date_reference()}]"
@@ -831,6 +958,20 @@ def handle_turn(transcribed_text, transcript):
             tools=tools,
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
+
+        # Some groups have an obvious default action. For a vague request like
+        # "how hot is it outside", qwen2.5:7b narrates ("I'll check the weather
+        # at home...") instead of calling the tool, even at temperature 0 — and
+        # the full-registry retry below narrates too. Run the default instead.
+        default = (DEFAULT_CALLS[group](transcribed_text)
+                   if group in DEFAULT_CALLS and looks_like_request(transcribed_text) else None)
+        if not response.message.tool_calls and default:
+            name, args = default
+            print(f"No tool call from group '{group}' — running default {name}({args})")
+            response.message.content = ""
+            response.message.tool_calls = [
+                Message.ToolCall(function=Message.ToolCall.Function(name=name, arguments=args))
+            ]
 
         # A misrouted group means the right tool was never offered. Retry once
         # with everything rather than answering wrongly — this costs the old
