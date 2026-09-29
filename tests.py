@@ -5,6 +5,7 @@ Jarvis test harness.
     python tests.py --quick      # structural checks only, no model calls
     python tests.py voice        # interactive microphone check
     python tests.py cache tools  # named suites only
+    python tests.py wake memory  # need no API keys, Ollama or jarvis.py
     python tests.py --list       # show suite names
 
 Nothing here sends an email, creates a calendar event, or writes a reminder.
@@ -87,9 +88,20 @@ def suite_imports():
         return False
 
     check("jarvis.py imports", True)
-    check("all 6 agents constructed", len(j.AGENTS) == 6, f"{len(j.AGENTS)} agents")
-    check("Pinecone index reachable", j.dense_index is not None)
-    check("main_loop did not auto-run", True, "module is importable")
+    # A key that isn't set is a choice, not a bug: skip. A service that has
+    # its key but crashed while starting is a failure.
+    for name, why in j.DISABLED_AGENTS.items():
+        if why.startswith("missing"):
+            skip(f"{name} started", why)
+        else:
+            check(f"{name} started", False, why)
+    check("at least one agent running", len(j.AGENTS) > 0, f"{len(j.AGENTS)} of 6 agents")
+    import os
+    if os.getenv("PINECONE_API_KEY"):
+        check("Pinecone index reachable", j.dense_index is not None)
+    else:
+        skip("Pinecone index reachable", "PINECONE_API_KEY not set")
+    check("assistant did not auto-run", True, "module is importable")
     return True
 
 
@@ -139,8 +151,12 @@ def suite_registry():
     full = schema_chars(j.ALL_TOOLS)
     biggest = max(schema_chars(t) for t in j.TOOL_GROUPS.values())
     print(f"        full payload ~{full // 4} tokens, largest group ~{biggest // 4} tokens")
-    check("largest group is well under the full payload", biggest < full / 2,
-          f"{biggest // 4} vs {full // 4} tokens")
+    if len(j.TOOL_GROUPS) < 3:
+        skip("largest group is well under the full payload",
+             f"only {len(j.TOOL_GROUPS)} group(s) running, routing has nothing to trim")
+    else:
+        check("largest group is well under the full payload", biggest < full / 2,
+              f"{biggest // 4} vs {full // 4} tokens")
 
 
 def suite_routing():
@@ -294,6 +310,9 @@ def suite_cache():
     j = load_jarvis()
     from ollama import chat
 
+    if "weather" not in j.TOOL_GROUPS:
+        skip("prefix cache checks", "built around the weather tools, which are off")
+        return
     tools = j.TOOL_GROUPS["weather"]
     base = [
         {"role": "system", "content": j.system_prompt},
@@ -310,7 +329,7 @@ def suite_cache():
     baseline = warm.prompt_eval_duration / 1e9
     check("repeated tool call reuses the prefix cache", baseline < 1.0, ms(baseline))
 
-    # Now the real test: a summarisation call in between, exactly as main_loop does.
+    # Now the real test: a summarisation call in between, exactly as handle_turn does.
     summary_messages = base + [
         {"role": "assistant", "content": ""},
         {"role": "tool", "tool_name": "get_current_weather",
@@ -330,7 +349,7 @@ def suite_cache():
 
     # Same tools object on both calls is what makes the above work.
     check("summarisation reuses the same tools list", True,
-          "main_loop passes tools= to both calls")
+          "handle_turn passes tools= to both calls")
 
 
 def suite_tools():
@@ -356,6 +375,11 @@ def suite_tools():
         ("skip this track", {"skip_song"}),
         ("play some jazz", {"search_song_and_queue"}),
     ]
+    for text, _ in cases:
+        group = j.route_tools(text)[0]
+        if group in j.DISABLED_GROUPS:
+            skip(f"tool choice: {text!r}", f"{group} is off ({j.DISABLED_GROUPS[group]})")
+    cases = [c for c in cases if j.route_tools(c[0])[0] not in j.DISABLED_GROUPS]
 
     # temperature 0 so a rerun gives the same answer. At the default temperature
     # qwen2.5:7b occasionally declines to call anything on a borderline phrase
@@ -382,7 +406,7 @@ def suite_tools():
           f"{correct}/{len(cases)}")
 
     # A routed group that produces nothing must still be recoverable, because
-    # that is exactly what main_loop does before giving up.
+    # that is exactly what handle_turn does before giving up.
     if misses:
         text, group, _ = misses[0]
         r = chat(model="qwen2.5:7b", tools=j.ALL_TOOLS, keep_alive=j.OLLAMA_KEEP_ALIVE,
@@ -420,26 +444,21 @@ def suite_latency():
     j = load_jarvis()
     from ollama import chat
     import numpy as np
-    import tempfile
-    import os
 
     j.kokoro_ready.wait()
     results = []
 
-    # Build a speech sample with Kokoro so this needs no fixture file.
-    audio = np.concatenate([a for _, _, a in
+    # Build a speech sample with Kokoro so this needs no fixture file, then
+    # resample 24 kHz -> 16 kHz, the array format mic.py hands to Whisper.
+    audio = np.concatenate([np.asarray(a) for _, _, a in
                             j.kokoro_pipeline("What is the weather in Boston right now?",
                                               voice="af_heart")])
-    import soundfile as sf
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        wav = f.name
-    sf.write(wav, audio, 24000)
+    samples = np.interp(np.arange(0, len(audio), 1.5), np.arange(len(audio)), audio).astype(np.float32)
 
-    import mlx_whisper
-    mlx_whisper.transcribe(wav, path_or_hf_repo="mlx-community/whisper-small-mlx")  # warm
+    j.transcribe(samples)  # warm
 
     t = time.time()
-    text = mlx_whisper.transcribe(wav, path_or_hf_repo="mlx-community/whisper-small-mlx")["text"]
+    j.transcribe(samples)
     results.append(("whisper transcribe", time.time() - t, 1.0))
 
     t = time.time()
@@ -469,8 +488,6 @@ def suite_latency():
     list(j.kokoro_pipeline("It is 72 degrees and clear in Boston.", voice="af_heart"))
     results.append(("first sentence synthesis", time.time() - t, 2.0))
 
-    os.remove(wav)
-
     print(f"\n        {'stage':28} {'measured':>10}  {'target':>8}")
     total = 0
     for name, took, target in results:
@@ -483,6 +500,99 @@ def suite_latency():
 
     for name, took, target in results:
         check(f"{name} within target", took <= target, f"{ms(took)} vs {ms(target)} target")
+
+
+def suite_wake():
+    """
+    Wake word detector on speech synthesised by macOS `say`, so no fixtures or
+    microphone. Doesn't load jarvis.py.
+    """
+    header("wake")
+    import os
+    import subprocess
+    import tempfile
+    import wave
+    import numpy as np
+    from wake_word import WakeWordDetector, FRAME
+
+    detector = WakeWordDetector()
+
+    def peak(phrase, voice):
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        subprocess.run(["say", "-v", voice, "-o", path, "--data-format=LEI16@16000", phrase], check=True)
+        audio = np.frombuffer(wave.open(path).readframes(10 ** 8), dtype=np.int16)
+        os.remove(path)
+        silence = np.zeros(16000, dtype=np.int16)
+        audio = np.concatenate([silence, audio, silence])
+        detector.reset()
+        return max(detector.score(audio[i:i + FRAME]) for i in range(0, len(audio) - FRAME, FRAME))
+
+    for voice in ("Samantha", "Daniel"):
+        score = peak("Hey Jarvis", voice)
+        check(f"detects 'Hey Jarvis' ({voice})", score >= 0.5, f"peak {score:.3f}")
+    score = peak("I was telling him about the game last night. Hey Jarvis. What time is it?", "Daniel")
+    check("detects the wake word mid-sentence", score >= 0.5, f"peak {score:.3f}")
+    score = peak("What's the weather like in Boston? Remind me to call my mother on Friday.", "Samantha")
+    check("ignores ordinary speech", score < 0.5, f"peak {score:.3f}")
+
+    silence_frame = np.zeros(FRAME, dtype=np.int16)
+    for _ in range(10):
+        detector.score(silence_frame)
+    t = time.time()
+    for _ in range(100):
+        detector.score(silence_frame)
+    per_frame = (time.time() - t) / 100
+    check("frame costs under 10% of real time", per_frame < 0.008,
+          f"{per_frame * 1000:.2f}ms per 80ms frame")
+
+
+def suite_memory():
+    """Obsidian daily notes, written to a throwaway vault. Doesn't load jarvis.py."""
+    header("memory")
+    import os
+    import tempfile
+    from datetime import datetime
+    import obsidian_store
+
+    previous = os.environ.get("OBSIDIAN_VAULT_PATH")
+    with tempfile.TemporaryDirectory() as vault:
+        os.environ["OBSIDIAN_VAULT_PATH"] = vault
+        when = datetime(2026, 9, 28, 14, 5)
+        summary = ("The user planned their week around a product launch on Friday. "
+                   "Jarvis blocked two mornings for deep work and set a reminder to email Sarah.")
+        note = obsidian_store.append_session(
+            summary, ["Prefers mornings for deep work"],
+            [{"name": "Product Launch", "note": "Launch is set for Friday."},
+             {"name": "Sarah", "note": "Needs the launch deck by Thursday."}],
+            title="Planning launch week", when=when)
+        obsidian_store.append_session(
+            "The user asked Jarvis to move the launch review with Sarah to Thursday.", [],
+            [{"name": "sarah", "note": "Launch review moved to Thursday."}],
+            when=when.replace(hour=18))
+        text = open(note).read() if note else ""
+        entities = os.path.join(vault, "Memory", "Entities")
+        sarah = open(os.path.join(entities, "Sarah.md")).read() if os.path.exists(os.path.join(entities, "Sarah.md")) else ""
+
+        check("daily note created under Memory/", note is not None and note.name == "2026-09-28.md")
+        check("note has one title", text.count("# Memory — September 28, 2026") == 1)
+        check("sessions appended with titles",
+              "## Session (14:05) — Planning launch week" in text and "## Session (18:05)" in text)
+        check("multi-sentence summary kept whole", summary in text)
+        check("facts listed", "- Prefers mornings for deep work" in text)
+        check("topics linked from the day", "[[Product Launch]] · [[Sarah]]" in text)
+        check("topic note links back to the day", "- [[2026-09-28]] 14:05 — Needs the launch deck by Thursday." in sarah)
+        check("same topic in another case reuses the note",
+              sorted(os.listdir(entities)) == ["Product Launch.md", "Sarah.md"] and sarah.count("[[2026-09-28]]") == 2)
+        check("existing topics are listed for reuse", obsidian_store.existing_topics() == ["Product Launch", "Sarah"])
+        check("empty session writes nothing", obsidian_store.append_session(None, [], when=when) is None)
+        os.environ["OBSIDIAN_VAULT_PATH"] = os.path.join(vault, "missing")
+        check("missing vault is skipped, not created",
+              obsidian_store.append_session("x", when=when) is None and not os.path.exists(os.path.join(vault, "missing")))
+    if previous is None:
+        os.environ.pop("OBSIDIAN_VAULT_PATH", None)
+    else:
+        os.environ["OBSIDIAN_VAULT_PATH"] = previous
 
 
 def suite_voice():
@@ -536,11 +646,13 @@ SUITES = {
     "cache": suite_cache,
     "tools": suite_tools,
     "latency": suite_latency,
+    "wake": suite_wake,
+    "memory": suite_memory,
     "voice": suite_voice,
 }
 
 QUICK = ["imports", "registry", "routing", "text"]
-DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "latency"]
+DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "latency", "wake", "memory"]
 
 
 def main():

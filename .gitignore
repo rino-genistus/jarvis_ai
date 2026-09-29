@@ -11,8 +11,9 @@ __pycache__/
 .venv/
 venv/
 
-# Runtime output
+# Runtime and build output
 logs/
+build/
 .cache
 
 # Local audio and voice models

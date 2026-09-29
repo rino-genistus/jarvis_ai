@@ -1,13 +1,16 @@
 # Jarvis — local-first voice assistant for Apple Silicon
 # Also requires Ollama running locally with qwen2.5:7b and llama3.2:1b pulled.
 
+# Wake word (wake_word.py runs the openwakeword models directly on onnxruntime)
+openwakeword
+onnxruntime
+
 # Voice pipeline
 SpeechRecognition
 PyAudio              # microphone backend for SpeechRecognition
 mlx-whisper
 kokoro
 sounddevice
-soundfile
 numpy
 
 # Reasoning and memory

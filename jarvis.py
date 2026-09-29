@@ -4,10 +4,11 @@ from elevenlabs.play import play
 import os
 import speech_recognition as sr
 import mlx_whisper
-from ollama import chat, ChatResponse
+from ollama import chat, generate, ChatResponse
 import time
-import tempfile
 from agents import Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent, RemindersAgent
+import mic
+import obsidian_store
 from datetime import datetime, timedelta
 from kokoro import KPipeline
 import sounddevice as sd
@@ -15,14 +16,22 @@ import numpy as np
 from pinecone import Pinecone
 import threading
 import inspect
+import json
 import queue
 import re
 
 start_time = time.time()
 
-# Keep Ollama models resident. The default 5 minute keep_alive means an idle
-# assistant pays a 4.4s reload for qwen and 2.3s for llama on the next command.
-OLLAMA_KEEP_ALIVE = -1
+# How long the engine stays warm after a conversation before the wake listener
+# retires it and memory drops back to just the wake word model.
+IDLE_UNLOAD_MINUTES = float(os.getenv("JARVIS_IDLE_UNLOAD_MINUTES", "10"))
+
+# Keep Ollama models resident across a burst of use — the default 5 minutes
+# means a reload of 4.4s for qwen and 2.3s for llama. Not forever, though:
+# shutdown() unloads them explicitly, and this bound frees them even if the
+# engine crashes before it gets the chance.
+OLLAMA_KEEP_ALIVE = f"{int(IDLE_UNLOAD_MINUTES) + 5}m"
+OLLAMA_MODELS = ("qwen2.5:7b", "llama3.2:1b")
 
 # Cap spoken replies. Generation and playback both scale with length, and a
 # 73 token answer is already 7.6 seconds of speech.
@@ -33,20 +42,34 @@ load_dotenv()
 current_date = datetime.now().strftime("%A, %B %d, %Y")
 print(current_date)
 
-pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index_name = 'jarvis-ai'
-if not pc.has_index(index_name):
-    pc.create_index_for_model(
-        name=index_name,
-        cloud="aws",
-        region="us-east-1",
-        embed={
-            "model":"llama-text-embed-v2",
-            "field_map":{"text": "chunk_text"}
-        }
-    )
+def connect_memory_index():
+    """
+    Pinecone is optional. Without a key (or if it's unreachable) Jarvis still
+    runs: nothing is recalled, and memories go to the Obsidian vault only.
+    """
+    if not os.getenv("PINECONE_API_KEY"):
+        print("PINECONE_API_KEY not set — memory recall off, Obsidian notes only")
+        return None
+    try:
+        pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+        index_name = 'jarvis-ai'
+        if not pc.has_index(index_name):
+            pc.create_index_for_model(
+                name=index_name,
+                cloud="aws",
+                region="us-east-1",
+                embed={
+                    "model":"llama-text-embed-v2",
+                    "field_map":{"text": "chunk_text"}
+                }
+            )
+        return pc.Index(index_name)
+    except Exception as e:
+        print(f"Pinecone unavailable ({e}) — memory recall off, Obsidian notes only")
+        return None
 
-dense_index = pc.Index(index_name)
+
+dense_index = connect_memory_index()
 
 eleven_labs = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
@@ -61,14 +84,39 @@ def load_kokoro():
 
 threading.Thread(target=load_kokoro, daemon=True).start()
 
-calendar = Calendar_Agents()
-websearch = WebSearchAgents()
-weather = WeatherSearch()
-spotify = SpotifyAgent()
-gmail = GmailAgent()
-reminders = RemindersAgent()
+# Each agent with the keys or files it can't work without. An agent missing
+# any of them is left out entirely, so the model is never offered a tool that
+# can only fail — and one broken service no longer stops Jarvis starting.
+AGENT_REQUIREMENTS = [
+    (Calendar_Agents, ["credentials.json"]),
+    (WebSearchAgents, ["TAVILY_API_KEY"]),
+    (WeatherSearch, ["OPENWEATHER_API_KEY"]),
+    (SpotifyAgent, ["SPOTIPY_CLIENT_ID", "SPOTIPY_CLIENT_SECRET", "SPOTIPY_REDIRECT_URI"]),
+    (GmailAgent, ["credentials.json"]),
+    (RemindersAgent, []),
+]
 
-AGENTS = [calendar, websearch, weather, spotify, gmail, reminders]
+DISABLED_AGENTS = {}   # class name -> why it's off
+
+
+def start_agents():
+    agents = []
+    for cls, needs in AGENT_REQUIREMENTS:
+        # A name ending in .json is a file in the project folder, anything else an env var
+        missing = [n for n in needs if not (os.path.exists(n) if n.endswith(".json") else os.getenv(n))]
+        if missing:
+            DISABLED_AGENTS[cls.__name__] = f"missing {', '.join(missing)}"
+        else:
+            try:
+                agents.append(cls())
+                continue
+            except Exception as e:
+                DISABLED_AGENTS[cls.__name__] = f"failed to start: {e}"
+        print(f"{cls.__name__} off — {DISABLED_AGENTS[cls.__name__]}")
+    return agents
+
+
+AGENTS = start_agents()
 
 def build_tool_registry(agents):
     """
@@ -137,6 +185,12 @@ def build_tool_groups(agents):
 TOOL_GROUPS = build_tool_groups(AGENTS)
 ALL_TOOLS = list(TOOL_REGISTRY.values())
 
+# Groups whose agent is switched off, so a request for one gets an honest
+# "not set up" instead of the model making the answer up.
+DISABLED_GROUPS = {GROUP_BY_CLASS[name]: why for name, why in DISABLED_AGENTS.items()}
+SERVICE_NAMES = {"weather": "Weather", "calendar": "Google Calendar", "music": "Spotify",
+                 "email": "Gmail", "reminders": "Reminders", "web": "Web search"}
+
 # Checked before the classifier runs. A hit skips the LLM entirely, which is
 # both faster and more reliable than asking a 1B model.
 GROUP_KEYWORDS = {
@@ -155,12 +209,13 @@ GROUP_KEYWORDS = {
 def route_tools(text):
     """
     Picks the tool group for a command. Returns (group_name, tools) or (None, None)
-    to mean 'no confident route, send everything'.
+    to mean 'no confident route, send everything'. A disabled group comes back
+    with an empty tools list.
     """
     lowered = text.lower()
     for group, words in GROUP_KEYWORDS.items():
         if any(word in lowered for word in words):
-            return group, TOOL_GROUPS[group]
+            return group, TOOL_GROUPS.get(group, [])
     return None, None
 
 
@@ -184,7 +239,7 @@ system_prompt = f"""
     You help with research, analysis, writing, coding, planning, scheduling, and reasoning through problems. When given tools, you use them efficiently and report back with only what's relevant.
 
     ## Memory
-    You only know what has been said in this conversation. You have no memory between sessions and no access to anything outside of the current conversation. Your slate is blank until the user tells you something — if asked about prior context, say so plainly.
+    Some messages begin with a bracketed note of what you know about the user from past sessions. Use it naturally, the way a long-serving aide would, without announcing that you remembered. Beyond those notes and this conversation you know nothing about the user's past — if asked about something not in either, say so plainly.
 
     ## Core Principles
     - Your user's goals are your goals. You advocate for their success.
@@ -192,7 +247,7 @@ system_prompt = f"""
     - You do not moralize, lecture, or add unsolicited caveats. You trust your user's judgment.
     - You are never sycophantic. Honest, direct assessment beats flattery every time.
     - When something is outside your ability, say so immediately and suggest alternatives.
-    - You have no memory between sessions. Never invent prior context, projects, people, or history that hasn't been explicitly stated in this conversation.
+    - Never invent prior context, projects, people, or history that isn't in your memory notes or this conversation.
     - When starting fresh with no context, greet the user briefly and ask what they need. Nothing more.
 
     Respond only with your spoken reply. No meta-commentary, no explaining what you're about to do — just do it.
@@ -231,18 +286,29 @@ candidate_labels = ["end_conversation", "continue_conversation"]
 r = sr.Recognizer()
 
 CHIME = object()          # queue marker: play the "your turn" tone
+SLEEP_TONE = object()     # queue marker: play the "stopped listening" tone
 _SPEAK_Q = queue.Queue()  # everything Jarvis says goes through here, in order
+
+
+def _tone(freq, duration=0.15):
+    sample_rate = 24000
+    t = np.linspace(0, duration, int(sample_rate * duration))
+    return (np.sin(2 * np.pi * freq * t) * 0.3).astype(np.float32)
 
 
 def _chime_samples():
     """
     Small tone so the user knows when Jarvis has finished talking.
     """
-    sample_rate = 24000
-    duration = 0.15
-    freq = 880
-    t = np.linspace(0, duration, int(sample_rate * duration))
-    return (np.sin(2 * np.pi * freq * t) * 0.3).astype(np.float32)
+    return _tone(880)
+
+
+def _sleep_samples():
+    """
+    Falling two-note tone: the conversation is over and Jarvis is back to
+    waiting for the wake word.
+    """
+    return np.concatenate([_tone(660, 0.12), _tone(440, 0.18)])
 
 
 def _speaker_worker():
@@ -263,6 +329,8 @@ def _speaker_worker():
         try:
             if item is CHIME:
                 stream.write(_chime_samples())
+            elif item is SLEEP_TONE:
+                stream.write(_sleep_samples())
             elif isinstance(item, threading.Event):
                 item.set()          # flush marker: everything before this has played
             elif item:
@@ -290,6 +358,10 @@ def say(text):
 
 def chime():
     _SPEAK_Q.put(CHIME)
+
+
+def sleep_tone():
+    _SPEAK_Q.put(SLEEP_TONE)
 
 
 def wait_until_spoken():
@@ -378,73 +450,184 @@ def record_audio_and_transcribe_elevenlabs():
         )
         return transcription.text
 
+WHISPER_MODEL = "mlx-community/whisper-small-mlx"
+
+
+def transcribe(samples):
+    """
+    Speech to text with MLX Whisper. Takes 16 kHz float32 samples from mic.py.
+    """
+    result = mlx_whisper.transcribe(samples, path_or_hf_repo=WHISPER_MODEL)
+    text = result["text"].strip()
+    print("User: ", text)
+    return text
+
+
 def record_audio_and_transcribe_mlx_whisper():
     """
-    Current transcription method for user - free. Runs efficiently on Mac Silicone chip
+    Current transcription method for user - free. Runs efficiently on Mac Silicone chip.
+    Returns "" if nobody spoke before the listen timeout.
     """
-    with sr.Microphone() as source:
-        r.energy_threshold = 200
-        r.pause_threshold = 0.8  # was 1.5 — that much dead air is felt directly as latency
-        r.phrase_threshold = 0.1
-        r.non_speaking_duration = 0.8
-        print("User Talks Now")
-        audio_text = r.listen(source, timeout=10, phrase_time_limit=45)
-        wav_audio_data = audio_text.get_wav_data()
+    samples = mic.record_command()
+    return transcribe(samples) if samples is not None else ""
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(wav_audio_data)
-            temp_path = f.name
 
-        result = mlx_whisper.transcribe(
-            temp_path,
-            path_or_hf_repo="mlx-community/whisper-small-mlx",
-        )
-
-        os.remove(temp_path)
-        print("User: ", result['text'].strip())
-        return result["text"].strip()
-
-def extract_important_messages(messages):
+def date_reference(days=8):
     """
-    Given the messages from the current chat, uses qwen2.5:7b model to review all messages and retreive list of meaningful messages
+    Today plus the coming days spelled out by name. Given only an ISO date,
+    qwen2.5:7b works out weekdays wrong, so "remind me Friday" lands on the
+    wrong day — and "next Friday" gets stored in memory as the wrong date.
     """
+    now = datetime.now()
+    upcoming = ", ".join(
+        (now + timedelta(days=offset)).strftime("%A %Y-%m-%d")
+        for offset in range(days)
+    )
+    return (f"Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}. "
+            f"Dates coming up: {upcoming}. "
+            f"Use these exact dates for any day the user names.")
+
+
+def extract_session_memory(conversation, known_topics=()):
+    """
+    Distils a finished conversation into structured memory with qwen2.5:7b:
+    a short title, a multi-sentence summary with the specifics, lasting facts
+    about the user, and the topics it touched.
+
+    Topics are how memories connect — each becomes an Obsidian note that every
+    later session mentioning it links to. The model is shown the topics that
+    already exist so it reuses "Toronto" rather than inventing "Toronto, Canada".
+
+    Returns None when nothing of substance happened. There is deliberately no
+    "worth remembering" flag first: asked up front, before it has written
+    anything, qwen dismissed a session where the user shared personal facts.
+    """
+    known = ", ".join(known_topics) if known_topics else "none yet"
     response = chat(
         model='qwen2.5:7b',
         keep_alive=OLLAMA_KEEP_ALIVE,
-        messages=[
-            {
-                "role": "user",
-                "content": f"""Review this conversation and extract only information worth remembering long-term about the user — preferences, facts, habits, goals, or anything personally relevant.
-                Ignore greetings, small talk, and one-off questions like weather lookups.
-                Return a list of concise factual statements, one per line. If nothing is worth remembering, return 'NONE'.
+        format="json",
+        options={"num_predict": 700},
+        messages=[{"role": "user", "content": f"""You maintain Jarvis's long-term memory of the user. {date_reference(15)}
 
-                Conversation:
-                {messages}"""
-            }
-        ]
+Read the conversation and reply with a JSON object with these keys:
+
+"title": three to six words naming what the conversation was about.
+"summary": three to five sentences in the past tense, written about "the user" — never "he" or "she", as the user's pronouns are unknown. Cover what the user said about themselves, what they wanted and why, what Jarvis did or found, anything decided or planned, and details likely to matter later. Keep the specifics: names, places, numbers and dates. Write relative dates like "next Friday" as calendar dates from the list above, and trust what the user said over anything Jarvis claimed. Skip pleasantries and Jarvis's offers of further help. Use "" only if nothing of substance happened, such as a bare greeting.
+"facts": lasting facts the user revealed — preferences, background, habits, relationships, goals, projects. Each a complete sentence. A fact about the user starts with "The user"; a fact about someone else names that person (for example "The user's sister Priya loves jazz."). Only what the user actually said, nothing inferred. Use [] if there are none.
+"topics": up to six people, places, projects, interests or recurring tasks that this conversation actually discussed, each as {{"name": "...", "note": "one sentence on what this conversation said about it"}}. Names in Title Case and singular. Topics that already exist: {known}. When one of those is discussed, reuse its name exactly — but never include a topic just because it exists.
+
+Conversation:
+{conversation}"""}]
     )
-    results = response.message.content.strip()
-    if results == "NONE":
-        return []
-    memories = [
-        line.strip().lstrip("0123456789.-) ")
-        for line in results.split('\n')
-        if line.strip()
-    ]
+    try:
+        data = json.loads(response.message.content)
+    except json.JSONDecodeError:
+        print(f"Memory extraction returned invalid JSON: {response.message.content[:200]}")
+        return None
 
-    records = [
-        {"id": f"mem-{int(time.time())}-{i}", "chunk_text": memory}
-        for i, memory in enumerate(memories)
-        if memory
-    ]
+    summary = str(data.get("summary") or "").strip()
+    facts = [str(f).strip() for f in data.get("facts") or [] if str(f).strip()]
+    topics = []
+    for topic in data.get("topics") or []:
+        if isinstance(topic, dict) and str(topic.get("name") or "").strip():
+            topics.append({"name": str(topic["name"]).strip(),
+                           "note": str(topic.get("note") or "").strip()})
+    # The model always writes *some* summary, even for "Hey Jarvis" and nothing
+    # else, so substance is judged by what it found rather than what it says.
+    if not summary or (not facts and not topics):
+        return None
+    return {
+        "title": str(data.get("title") or "").strip(),
+        "summary": summary,
+        "facts": facts,
+        "topics": topics[:6],
+    }
 
-    print(f"Storing {len(records)} memories: {[r['chunk_text'] for r in records]}")
-    return records
+
+def relevant_topics(conversation, known_topics):
+    """
+    The existing topics this conversation plausibly touches — any word of the
+    name (4+ letters) appears in it. Showing the model every topic in the vault
+    made it attach unrelated ones ("Weather: not discussed").
+    """
+    text = conversation.lower()
+    return [name for name in known_topics
+            if any(len(word) >= 4 and word in text for word in name.lower().split())]
+
+
+def save_session_memories(transcript):
+    """
+    Distils a finished session into both memory stores: the facts and the
+    summary go to Pinecone for recall, and to the Obsidian vault — a daily note
+    plus a note per topic — for the user to read and browse as a graph.
+
+    Runs on a background thread, so it must never raise — a failure in one
+    store is logged and doesn't stop the other.
+    """
+    if not transcript:
+        return
+    # Built from the raw turns, not `messages`, so the injected memory notes
+    # aren't re-extracted as if the user had just said them.
+    conversation = "\n".join(f"{who}: {text}" for who, text in transcript)
+    try:
+        known = relevant_topics(conversation, obsidian_store.existing_topics())
+        memory = extract_session_memory(conversation, known)
+    except Exception as e:
+        print(f"Memory extraction failed: {e}")
+        return
+    if memory is None:
+        print("Nothing worth remembering from this session")
+        return
+
+    now = datetime.now()
+    stamp = int(now.timestamp())
+    records = [{"id": f"mem-{stamp}-{i}", "chunk_text": fact} for i, fact in enumerate(memory["facts"])]
+    # The whole summary, not a one-liner, so recall brings back the context too
+    records.append({"id": f"episode-{stamp}",
+                    "chunk_text": f"On {now.strftime('%A, %B %d, %Y')}: {memory['summary']}"})
+    print(f"Storing {len(records)} memories: {[rec['chunk_text'] for rec in records]}")
+    if dense_index is not None:
+        try:
+            dense_index.upsert_records(namespace="jarvis-memory-namespace", records=records)
+        except Exception as e:
+            print(f"Pinecone write failed: {e}")
+
+    try:
+        note = obsidian_store.append_session(memory["summary"], memory["facts"], memory["topics"],
+                                             title=memory["title"], when=now)
+        if note:
+            print(f"Obsidian note updated: {note}")
+    except Exception as e:
+        print(f"Obsidian write failed: {e}")
+
+
+_memory_threads = []
+
+
+def remember_in_background(transcript):
+    """
+    Save a session's memories without making the user wait for two LLM calls.
+    Non-daemon, and tracked, so shutdown() can make sure nothing is lost.
+    """
+    if not transcript:
+        return
+    thread = threading.Thread(target=save_session_memories, args=(list(transcript),))
+    thread.start()
+    _memory_threads.append(thread)
+
+
+def flush_memories():
+    """Block until every pending memory write has finished."""
+    while _memory_threads:
+        _memory_threads.pop().join()
 
 def retrieve_memories(query: str, top_k: int = 5):
     """
     Retrieves most meaningful messages from Pinecone Vector DB for conversation context
     """
+    if dense_index is None:
+        return []
     results = dense_index.search(
         namespace="jarvis-memory-namespace",
         query={"inputs": {"text": query}, "top_k": top_k},
@@ -530,17 +713,12 @@ def prewarm():
     first command, which otherwise costs 4.4s + 2.3s + the Whisper load.
     """
     try:
-        for model in ("qwen2.5:7b", "llama3.2:1b"):
+        for model in OLLAMA_MODELS:
             chat(model=model, keep_alive=OLLAMA_KEEP_ALIVE,
                  options={"num_predict": 1},
                  messages=[{"role": "user", "content": "hi"}])
-        import soundfile as sf
-        silence = np.zeros(16000, dtype=np.float32)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            path = f.name
-        sf.write(path, silence, 16000)
-        mlx_whisper.transcribe(path, path_or_hf_repo="mlx-community/whisper-small-mlx")
-        os.remove(path)
+        mlx_whisper.transcribe(np.zeros(mic.WHISPER_RATE, dtype=np.float32),
+                               path_or_hf_repo=WHISPER_MODEL)
         print("Models prewarmed")
     except Exception as e:
         print(f"Prewarm skipped: {e}")
@@ -560,162 +738,165 @@ def select_tools(text):
     return group, tools
 
 
-def main_loop():
+def not_set_up_reply(group):
+    """Spoken when a request routes to an agent that is switched off."""
+    # Kept speakable: Kokoro reading out OPENWEATHER_API_KEY letter by letter helps nobody
+    why = DISABLED_GROUPS.get(group, "")
+    service = SERVICE_NAMES.get(group, group)
+    if "credentials.json" in why:
+        return f"{service} isn't set up yet, sir. The Google credentials file is missing from my folder."
+    if why.startswith("missing"):
+        return f"{service} isn't set up yet, sir. Its API key needs adding to my settings file."
+    return f"{service} isn't available right now, sir. It failed to start — the log has the details."
+
+
+def handle_turn(transcribed_text, transcript):
     """
-    Main Program Loop
+    Answer one command. Returns True when the user has ended the conversation.
+
+    `transcript` collects the raw (speaker, text) turns for memory extraction.
     """
-    with sr.Microphone() as source:
-        print("Calibrating microphone...")
-        r.adjust_for_ambient_noise(source, duration=0.3)
-        r.dynamic_energy_threshold = False
     # Dispatch table and tool schemas both come from the shared registry
     available_functions = TOOL_REGISTRY
+    spoken = ""
+    turn_start = time.time()
+    transcript.append(("User", transcribed_text))
 
-    while True:
-        spoken = ""
-        # Never start recording while Jarvis is still talking, or the mic picks
-        # him up. Playback is asynchronous now, so this has to be explicit.
-        wait_until_spoken()
+    # Intent and memory both depend only on the transcript and nothing else,
+    # so run them together. Pinecone is a network call that has hit 1.6s.
+    parallel = {}
+    def _classify():
+        parallel["intent"] = classify_intent(transcribed_text)
+    def _recall():
+        try:
+            parallel["memories"] = retrieve_memories(transcribed_text)
+        except Exception as e:
+            print(f"Memory retrieval failed: {e}")
+            parallel["memories"] = []
+    threads = [threading.Thread(target=_classify), threading.Thread(target=_recall)]
+    for t in threads: t.start()
+    for t in threads: t.join()
 
-        transcribed_text = record_audio_and_transcribe_mlx_whisper() #User Text
-        turn_start = time.time()
+    intent = parallel.get("intent", "chat")
+    memories = parallel.get("memories", [])
+    print(f"Intent: {intent}  (routing took {time.time() - turn_start:.2f}s)")
 
-        # Intent and memory both depend only on the transcript and nothing else,
-        # so run them together. Pinecone is a network call that has hit 1.6s.
-        parallel = {}
-        def _classify():
-            parallel["intent"] = classify_intent(transcribed_text)
-        def _recall():
-            try:
-                parallel["memories"] = retrieve_memories(transcribed_text)
-            except Exception as e:
-                print(f"Memory retrieval failed: {e}")
-                parallel["memories"] = []
-        threads = [threading.Thread(target=_classify), threading.Thread(target=_recall)]
-        for t in threads: t.start()
-        for t in threads: t.join()
+    user_content = transcribed_text
+    if memories:
+        memory_block = "\n".join(f"- {m}" for m in memories)
+        # Memories ride on the user message, never messages[0]. Rewriting the
+        # system prompt changed the first tokens of the prompt and threw away
+        # Ollama's prefix cache every single turn — a measured 13.8s penalty.
+        user_content = f"[What you know about the user:\n{memory_block}]\n\n{transcribed_text}"
 
-        intent = parallel.get("intent", "chat")
-        memories = parallel.get("memories", [])
-        print(f"Intent: {intent}  (routing took {time.time() - turn_start:.2f}s)")
+    messages.append({"role": "user", "content": user_content})
 
-        user_content = transcribed_text
-        if memories:
-            memory_block = "\n".join(f"- {m}" for m in memories)
-            # Memories ride on the user message, never messages[0]. Rewriting the
-            # system prompt changed the first tokens of the prompt and threw away
-            # Ollama's prefix cache every single turn — a measured 13.8s penalty.
-            user_content = f"[What you know about the user:\n{memory_block}]\n\n{transcribed_text}"
+    if intent == 'exit':
+        #User is leaving or conversation is done
+        completion = chat(model="qwen2.5:7b", messages=messages, stream=True,
+                          keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
+        spoken = speak_stream(completion)
+        messages.append({"role": "assistant", "content": spoken})
+        transcript.append(("Jarvis", spoken))
+        # Memories are saved by run_session once the conversation closes
+        return True
 
-        messages.append({"role": "user", "content": user_content})
-
-        if intent == 'exit':
-            #User is leaving or conversation is done
-            completion = chat(model="qwen2.5:7b", messages=messages, stream=True,
-                              keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
-            spoken = speak_stream(completion)
+    elif intent == 'tool':
+        #Needs tool usage
+        group, tools = select_tools(transcribed_text)
+        # Checked before "Right away sir" — promising action and then saying
+        # the service is off would be worse than just saying so.
+        if group in DISABLED_GROUPS:
+            spoken = not_set_up_reply(group)
+            print(f"Tool group '{group}' is off: {DISABLED_GROUPS[group]}")
+            say(spoken)
             messages.append({"role": "assistant", "content": spoken})
+            transcript.append(("Jarvis", spoken))
             chime()
-            wait_until_spoken()
-            mems_list = extract_important_messages(messages=messages) #Gets meaningful messages from conversation
-            if mems_list:
-                #Uploading meaningful memories to pinecone
-                dense_index.upsert_records(namespace="jarvis-memory-namespace",records=mems_list)
-            break
+            return False
+        # Queued, not blocking — this plays over the model call instead of
+        # delaying it by the 2.2s it takes to speak.
+        say("Right away sir.")
+        print(f"Tool group: {group} ({len(tools)} tools)")
 
-        elif intent == 'tool':
-            #Needs tool usage
-            # Queued, not blocking — this plays over the model call instead of
-            # delaying it by the 2.2s it takes to speak.
-            say("Right away sir.")
+        date_context = f"[{date_reference()}]"
+        dated_messages = messages[:-1] + [{
+            "role": "user",
+            "content": f"{date_context} {messages[-1]['content']}"
+        }]
+        llm_start = time.time()
+        response: ChatResponse = chat(
+            model='qwen2.5:7b',
+            messages=dated_messages,
+            tools=tools,
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
 
-            group, tools = select_tools(transcribed_text)
-            print(f"Tool group: {group} ({len(tools)} tools)")
-
-            # Spell out the coming week by name. Given only an ISO date, qwen2.5:7b
-            # works out weekdays wrong, so "remind me Friday" lands on the wrong day.
-            now = datetime.now()
-            upcoming = ", ".join(
-                (now + timedelta(days=offset)).strftime("%A %Y-%m-%d")
-                for offset in range(8)
-            )
-            date_context = (
-                f"[Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}. "
-                f"Dates this coming week: {upcoming}. "
-                f"Use these exact dates for any day the user names.]"
-            )
-            dated_messages = messages[:-1] + [{
-                "role": "user",
-                "content": f"{date_context} {messages[-1]['content']}"
-            }]
-            llm_start = time.time()
+        # A misrouted group means the right tool was never offered. Retry once
+        # with everything rather than answering wrongly — this costs the old
+        # latency in the rare miss instead of paying it on every command.
+        if not response.message.tool_calls and tools is not ALL_TOOLS:
+            print(f"No tool call from group '{group}' — retrying with all {len(ALL_TOOLS)} tools")
+            tools = ALL_TOOLS
             response: ChatResponse = chat(
                 model='qwen2.5:7b',
                 messages=dated_messages,
                 tools=tools,
                 keep_alive=OLLAMA_KEEP_ALIVE,
             )
+        print(f"Tool selection took {time.time() - llm_start:.2f}s")
 
-            # A misrouted group means the right tool was never offered. Retry once
-            # with everything rather than answering wrongly — this costs the old
-            # latency in the rare miss instead of paying it on every command.
-            if not response.message.tool_calls and tools is not ALL_TOOLS:
-                print(f"No tool call from group '{group}' — retrying with all {len(ALL_TOOLS)} tools")
-                tools = ALL_TOOLS
-                response: ChatResponse = chat(
-                    model='qwen2.5:7b',
-                    messages=dated_messages,
-                    tools=tools,
-                    keep_alive=OLLAMA_KEEP_ALIVE,
-                )
-            print(f"Tool selection took {time.time() - llm_start:.2f}s")
+        messages.append({"role": "assistant", "content": response.message.content or ""})
 
-            messages.append({"role": "assistant", "content": response.message.content or ""})
+        if response.message.tool_calls: #Loops through all required tool calls to finish task
+            for tool_call in response.message.tool_calls:
+                if tool_call.function.name in available_functions:
+                    print(f"Calling {tool_call.function.name} with {tool_call.function.arguments}")
+                    try:
+                        result = available_functions[tool_call.function.name](**tool_call.function.arguments) #Calls tool calls to complete task
+                    except Exception as e:
+                        # Hand the failure back to the model as text so it can
+                        # explain itself instead of crashing the session.
+                        result = f"That tool failed: {e}"
+                    print(f"Tool result: {result}")
+                    messages.append({"role": "tool", "tool_name": tool_call.function.name, "content": str(result)})
 
-            if response.message.tool_calls: #Loops through all required tool calls to finish task
-                for tool_call in response.message.tool_calls:
-                    if tool_call.function.name in available_functions:
-                        print(f"Calling {tool_call.function.name} with {tool_call.function.arguments}")
-                        try:
-                            result = available_functions[tool_call.function.name](**tool_call.function.arguments) #Calls tool calls to complete task
-                        except Exception as e:
-                            # Hand the failure back to the model as text so it can
-                            # explain itself instead of crashing the session.
-                            result = f"That tool failed: {e}"
-                        print(f"Tool result: {result}")
-                        messages.append({"role": "tool", "tool_name": tool_call.function.name, "content": str(result)})
+            messages.append({
+                "role": "user",
+                "content": "Summarize the tool results naturally in Jarvis's voice. Two sentences at most. Do not call any more tools."
+            }) #Summarizes what was just done
 
-                messages.append({
-                    "role": "user",
-                    "content": "Summarize the tool results naturally in Jarvis's voice. Two sentences at most. Do not call any more tools."
-                }) #Summarizes what was just done
-
-                # Same tools list as the call above on purpose. Ollama keeps one
-                # KV cache slot per model, so a summarisation request with a
-                # different prefix evicted the tool prefix and forced a full
-                # reprocess on the next command — measured 41ms vs 13,524ms.
-                follow_up = chat(model='qwen2.5:7b', messages=messages, tools=tools,
-                                 stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
-                                 options=GEN_OPTIONS)
-                spoken = speak_stream(follow_up)
-                messages.append({"role": "assistant", "content": spoken})
-            else:
-                spoken = response.message.content or response.message.thinking or ""
-                safe_speak(spoken)
-
-        else:  # chat
-            response = chat(model='qwen2.5:7b', messages=messages, stream=True,
-                            keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
-            spoken = speak_stream(response)
+            # Same tools list as the call above on purpose. Ollama keeps one
+            # KV cache slot per model, so a summarisation request with a
+            # different prefix evicted the tool prefix and forced a full
+            # reprocess on the next command — measured 41ms vs 13,524ms.
+            follow_up = chat(model='qwen2.5:7b', messages=messages, tools=tools,
+                             stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
+                             options=GEN_OPTIONS)
+            spoken = speak_stream(follow_up)
             messages.append({"role": "assistant", "content": spoken})
+        else:
+            spoken = response.message.content or response.message.thinking or ""
+            safe_speak(spoken)
 
-        print("Jarvis:", spoken)
-        print(f"Turn latency (transcript -> speech queued): {time.time() - turn_start:.2f}s")
-        chime()
+    else:  # chat
+        # Same dated copy as the tool path. Without it Jarvis states wrong dates
+        # ("next Friday" became a Wednesday), and memory then records them.
+        dated_messages = messages[:-1] + [{
+            "role": "user",
+            "content": f"[{date_reference()}] {messages[-1]['content']}"
+        }]
+        response = chat(model='qwen2.5:7b', messages=dated_messages, stream=True,
+                        keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
+        spoken = speak_stream(response)
+        messages.append({"role": "assistant", "content": spoken})
 
+    print("Jarvis:", spoken)
+    print(f"Turn latency (transcript -> speech queued): {time.time() - turn_start:.2f}s")
+    transcript.append(("Jarvis", spoken))
+    chime()
+    return False
 
-"""def contains_exit_phrase(transcribed_text):
-    return any(phrase in transcribed_text for phrase in EXIT_PHRASES)"""
 
 def startup():
     """
@@ -729,7 +910,58 @@ def startup():
     print(f"Startup complete in {time.time() - start_time:.2f}s")
 
 
+def run_session(first_audio=None):
+    """
+    One conversation, from wake word to goodbye.
+
+    Keeps listening for follow-ups without the wake word until the user says
+    goodbye or stays quiet for mic.LISTEN_TIMEOUT seconds. Then the falling tone
+    plays, memories are saved in the background, and the history is cleared so
+    the next conversation starts clean.
+
+    first_audio is a command already recorded while the engine was loading.
+    """
+    transcript = []
+    pending = first_audio
+    while True:
+        # Never start recording while Jarvis is still talking, or the mic picks
+        # him up. Playback is asynchronous, so this has to be explicit.
+        wait_until_spoken()
+        samples = pending if pending is not None else mic.record_command()
+        pending = None
+        if samples is None:
+            print("No speech — ending conversation")
+            break
+        text = transcribe(samples)
+        if not text:
+            continue
+        if handle_turn(text, transcript):
+            break
+
+    sleep_tone()
+    wait_until_spoken()
+    del messages[1:]
+    remember_in_background(transcript)
+
+
+def shutdown():
+    """
+    Called before the engine process exits: finish memory writes, then hand
+    the Ollama models' memory back instead of waiting out keep_alive.
+    """
+    flush_memories()
+    for model in OLLAMA_MODELS:
+        try:
+            generate(model=model, prompt="", keep_alive=0)
+        except Exception as e:
+            print(f"Could not unload {model}: {e}")
+
+
 # Guarded so tests.py can import this module without launching the assistant.
+# Running this file directly holds a single conversation with no wake word —
+# handy for debugging and for completing the Google and Spotify logins the
+# first time. The background assistant is wake_listener.py.
 if __name__ == "__main__":
     startup()
-    main_loop()
+    run_session()
+    shutdown()
