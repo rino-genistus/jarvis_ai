@@ -1,0 +1,29 @@
+# Jarvis — local-first voice assistant for Apple Silicon
+# Also requires Ollama running locally with qwen2.5:7b and llama3.2:1b pulled.
+
+# Voice pipeline
+SpeechRecognition
+PyAudio              # microphone backend for SpeechRecognition
+mlx-whisper
+kokoro
+sounddevice
+soundfile
+numpy
+
+# Reasoning and memory
+ollama
+pinecone
+
+# Agents
+google-api-python-client
+google-auth-oauthlib
+spotipy
+tavily-python
+requests
+beautifulsoup4
+
+# Config
+python-dotenv
+
+# Optional: ElevenLabs TTS/STT, wired up but inactive
+elevenlabs

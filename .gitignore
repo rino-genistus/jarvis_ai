@@ -1,8 +1,24 @@
+# Secrets and auth tokens
 .env
 .spotify_token
 token.json
-.cache
-credential.txt
 credentials.json
+credential.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime output
+logs/
+.cache
+
+# Local audio and voice models
+*.wav
 voices/
 *.onnx
+
+# macOS
+.DS_Store

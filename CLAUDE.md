@@ -1,7 +1,9 @@
 # CLAUDE.md — Jarvis AI
 
-Personal voice-controlled AI assistant running entirely on local infrastructure (Mac Silicon).
-Users speak → MLX Whisper transcribes → Ollama/qwen2.5 reasons + calls tools → Kokoro speaks back.
+Personal voice-controlled AI assistant running locally on Apple Silicon.
+User speaks → MLX Whisper transcribes → Ollama/qwen2.5:7b reasons and calls tools → Kokoro speaks back.
+
+See `PROGRESS.md` for the public summary of what's built and what's next. Keep the two in sync.
 
 ---
 
@@ -9,13 +11,15 @@ Users speak → MLX Whisper transcribes → Ollama/qwen2.5 reasons + calls tools
 
 ```
 jarvis_ai/
-├── jarvis.py          # Main loop: voice pipeline, intent routing, memory, TTS
-├── agents.py          # All tool/agent class definitions
-├── credentials.json   # Google OAuth2 credentials (never commit)
+├── jarvis.py          # Main loop: voice pipeline, intent + tool routing, memory, TTS
+├── agents.py          # All agent classes; every public method is a tool
+├── tests.py           # Test harness (structural, routing, tool choice, latency, voice)
+├── requirements.txt   # Python dependencies
+├── PROGRESS.md        # Public progress summary and roadmap
+├── credentials.json   # Google OAuth2 client (never commit)
 ├── token.json         # Google OAuth2 token (auto-generated, never commit)
-├── .spotify_token     # Spotify token cache (auto-generated)
-├── .env               # All API keys (never commit)
-└── directory_cache.json  # Auto-built file system index (~/.jarvis_ai/directory_cache.json)
+├── .spotify_token     # Spotify token cache (auto-generated, never commit)
+└── .env               # API keys (never commit)
 ```
 
 ---
@@ -24,44 +28,52 @@ jarvis_ai/
 
 ### Voice Pipeline (jarvis.py)
 ```
-Always-on background listener (pvporcupine)
-        ↓  "Jarvis" detected
-    🔔 chime → record command (mlx_whisper) → transcribed text
-                                                      ↓
-                                            classify_intent()  [llama3.2:1b]
-                                                      ↓
-                                  ┌──────────────────┼──────────────────┐
-                                exit               tool                chat
-                                  ↓                  ↓                   ↓
-                          save memories      "Right away sir"     qwen2.5:14b
-                          + reset session    + tool loop          direct reply
-                                  ↓                  ↓
-                           Pinecone upsert    summarise results
-                           return to idle           ↓
-                                             Kokoro TTS → sounddevice
-                                                      ↓
-                                                  🔔 chime → back to idle
+startup(): Kokoro loads + Ollama/Whisper prewarm in parallel
+        ↓
+record_audio_and_transcribe_mlx_whisper()   speech_recognition mic → whisper-small-mlx
+        ↓
+classify_intent() [llama3.2:1b]  ║  retrieve_memories() [Pinecone]    ← run in parallel
+        ↓
+   ┌────────────────┼────────────────┐
+ exit              tool             chat
+   ↓                ↓                ↓
+farewell      "Right away sir."   qwen2.5:7b
++ extract     select_tools()      streamed reply
++ upsert      → tool call
++ exit        → summarise
+        ↓
+speak_stream() → say() → speaker thread → Kokoro → sounddevice → chime
 ```
 
-### Intent Classification
-Three intents routed by `classify_intent()` using `llama3.2:1b` (fast, local):
-- **`exit`** — user is ending the session → farewell + extract + store memories → break
-- **`tool`** — needs real-world action (weather, calendar, Spotify, email, computer) → tool loop
-- **`chat`** — general Q&A or reasoning → direct `qwen2.5:14b` reply, no tools
+There is no wake word yet: the loop starts recording immediately, and the `exit` intent ends the process.
 
-### Tool Execution Loop (intent == 'tool')
-1. Inject today's date into the user message
-2. Call `qwen2.5:14b` with full tools list
-3. If `tool_calls` present: execute each via `available_functions[name](**args)`
-4. Append each result as a `role: tool` message
-5. Ask model to summarise results in Jarvis's voice
-6. Speak the summary via Kokoro
+### Intent Classification
+`classify_intent()` uses `llama3.2:1b` (4 tokens max) to return one of:
+- **`exit`**: ending the session → streamed farewell, extract memories, upsert to Pinecone, `break`
+- **`tool`**: needs real-world action or data → tool routing + tool call
+- **`chat`**: general conversation → streamed `qwen2.5:7b` reply, no tools
+
+### Tool Routing (intent == 'tool')
+Sending all 45 tool schemas costs about 3,600 prompt tokens and makes qwen2.5:7b ignore tools. `select_tools()` narrows it:
+1. `route_tools()`: keyword match against `GROUP_KEYWORDS`, with no LLM call
+2. `classify_tool_group()`: `llama3.2:1b` picks a group if no keyword matched
+3. Fallback: `ALL_TOOLS`
+
+If the routed group yields no tool call, the call is retried once with `ALL_TOOLS`.
+
+### Tool Execution
+1. Prefix the user message with today's date and the named dates of the coming week (qwen gets weekdays wrong from an ISO date alone)
+2. Call `qwen2.5:7b` with the selected tools
+3. Execute each `tool_call` via `TOOL_REGISTRY[name](**args)`; exceptions become a text result instead of crashing
+4. Append results as `role: tool` messages with `tool_name` (Ollama format)
+5. Ask for a two-sentence summary **with the same tools list** (keeps Ollama's KV cache prefix; a different prefix cost 13.5s on the next command)
+6. Stream the summary to speech
 
 ### Memory System (Pinecone)
-- **Storage**: Pinecone dense index `jarvis-memory-namespace`, model `llama-text-embed-v2`
-- **Retrieval**: `retrieve_memories(query)` runs on every turn — top-5 hits injected into system prompt
-- **Extraction**: On `exit`, `extract_important_messages()` uses `qwen2.5:14b` to distil the session into facts
-- **What gets stored**: preferences, habits, personal facts, goals — NOT small talk or one-off lookups
+- **Index**: `jarvis-ai`, namespace `jarvis-memory-namespace`, integrated embedding `llama-text-embed-v2`, `field_map {"text": "chunk_text"}`
+- **Records**: `{"id": "mem-<ts>-<i>", "chunk_text": ...}`. The field name must stay `chunk_text` to match the field map.
+- **Retrieval**: `retrieve_memories(query, top_k=5)` on every turn. Hits are prepended to the **user message**, never `messages[0]`; rewriting the system prompt invalidated Ollama's prefix cache (measured 13.8s penalty).
+- **Extraction**: only on `exit`, synchronously, via `extract_important_messages()` with `qwen2.5:7b`. Stores preferences, habits, personal facts and goals, not small talk or one-off lookups.
 
 ---
 
@@ -69,76 +81,68 @@ Three intents routed by `classify_intent()` using `llama3.2:1b` (fast, local):
 
 | Model | Purpose | Runtime |
 |---|---|---|
-| `qwen2.5:14b` | Main reasoning, tool calling, summarisation, memory extraction | Ollama (local) |
-| `llama3.2:1b` | Intent classification only (fast) | Ollama (local) |
-| `mlx-community/whisper-small-mlx` | Speech-to-text transcription | MLX (Apple Silicon) |
-| `hexgrad/Kokoro-82M` | Text-to-speech output | Kokoro (local) |
-| `llama-text-embed-v2` | Memory embeddings in Pinecone | Pinecone hosted |
+| `qwen2.5:7b` | Reasoning, tool calling, summarisation, memory extraction | Ollama (local) |
+| `llama3.2:1b` | Intent classification + tool-group fallback | Ollama (local) |
+| `mlx-community/whisper-small-mlx` | Speech-to-text | MLX (Apple Silicon) |
+| `hexgrad/Kokoro-82M` (voice `af_heart`) | Text-to-speech | Kokoro (local) |
+| `llama-text-embed-v2` | Memory embeddings | Pinecone hosted |
 
-### Planned (Not Yet Active)
-- **ElevenLabs TTS** (`eleven_turbo_v2_5`, voice `k7IRoeykhdGZUkTeJ1ID`) — final release TTS, replaces Kokoro
-- **ElevenLabs STT** (`scribe_v2`) — final release transcription, replaces MLX Whisper
+Ollama models use `keep_alive=-1` so they stay resident. Spoken replies are capped with `GEN_OPTIONS = {"num_predict": 160}`.
+
+### Wired Up but Inactive
+- **ElevenLabs TTS** (`eleven_turbo_v2_5`, voice `k7IRoeykhdGZUkTeJ1ID`): `play_audio_with_text_eleven_labs()`
+- **ElevenLabs STT** (`scribe_v2`): `record_audio_and_transcribe_elevenlabs()`
+
+Unused for cost reasons. Do not remove them: they are the target production audio stack.
 
 ---
 
 ## Agent Classes (agents.py)
 
-Each class is independently instantiated in `jarvis.py`. Methods are passed directly to Ollama as tools.
+45 tools across 6 agents. Every public bound method becomes a tool; methods starting with `_` are internal helpers.
 
-| Class | Tools | External Service |
-|---|---|---|
-| `Calendar_Agents` | `create_event`, `get_calendar_events`, `update_calendar_event`, `delete_calendar_event` | Google Calendar API |
-| `WebSearchAgents` | `search_web`, `extract_webpages` | Tavily API |
-| `WeatherSearch` | `get_current_weather`, `get_weather_with_time`, `get_daily_forecast`, `get_weather_alerts` | OpenWeatherMap API (One Call 3.0) |
-| `SpotifyAgent` | `get_current_track`, `search_song_and_queue`, `create_playlist`, `add_song_to_playlist`, `recently_played`, `skip_song`, `pause_song`, `shuffle`, `set_volume` | Spotify API (spotipy) |
-| `GmailAgent` | `send_email`, `search_email`, `get_unread_emails`, `get_email_by_id`, `reply_to_email`, `mark_as_read`, `trash_email`, `remove_email_from_trash`, `get_drafts`, `get_sent_emails`, `get_sender_profile`, `get_all_labels` | Gmail API |
-| `ComputerControlAgent` | `open_application`, `close_application`, `switch_application`, `list_open_applications`, `open_file`, `create_file`, `delete_file`, `move_file` | macOS (subprocess, AppKit, osascript) |
+| Class | Group | Tools | Service |
+|---|---|---|---|
+| `Calendar_Agents` | calendar | `create_event`, `get_calendar_events`, `update_calendar_event`, `delete_calendar_event` | Google Calendar API |
+| `WebSearchAgents` | web | `search_web`, `extract_webpages`, `crawl_webpages`, `research` | Tavily |
+| `WeatherSearch` | weather | `get_current_weather`, `get_weather_with_time`, `get_daily_forecast`, `get_weather_alerts` | OpenWeatherMap One Call 3.0 |
+| `SpotifyAgent` | music | `get_current_track`, `search_song_and_queue`, `create_playlist`, `add_song_to_playlist`, `recently_played`, `skip_song`, `previous_song`, `pause_song`, `resume_song`, `shuffle`, `set_volume` | Spotify (spotipy) |
+| `GmailAgent` | email | `send_email`, `search_email`, `get_unread_emails`, `get_email_by_id`, `reply_to_email`, `mark_as_read`, `mark_as_unread`, `trash_email`, `remove_email_from_trash`, `get_drafts`, `send_draft`, `get_sent_emails`, `get_sender_profile`, `get_all_labels` | Gmail API |
+| `RemindersAgent` | reminders | `get_reminder_lists`, `add_reminder`, `get_reminders`, `get_due_reminders`, `complete_reminder`, `delete_reminder`, `update_reminder`, `create_reminder_list` | macOS Reminders via JXA |
 
 ### Adding a New Agent
-1. Define a class in `agents.py` with methods that have clear docstrings — Ollama uses these as tool descriptions
-2. Instantiate it at the top of `jarvis.py` alongside the other agents
-3. Add all methods to both `available_functions` dict AND the `tools=[]` list in the tool call block
-4. Both locations must stay in sync — missing from either breaks tool execution
+1. Define a class in `agents.py`. Docstrings and type hints become the tool description Ollama sees, so write them for the model.
+2. Instantiate it in `jarvis.py` and add it to `AGENTS`.
+3. Add its class name to `GROUP_BY_CLASS` (startup raises if missing) and its trigger words to `GROUP_KEYWORDS`.
+4. Tool names must be unique across all agents: `build_tool_registry()` raises on duplicates.
+
+There is no hand-maintained tool list. `TOOL_REGISTRY`, `TOOL_GROUPS` and `ALL_TOOLS` are all derived from `AGENTS`.
 
 ---
 
 ## Key Behaviours & Constraints
 
-### Voice Output Rules
-- Kokoro loads async on startup via `threading.Thread` — `kokoro_ready.wait()` blocks main loop until ready
-- All TTS goes through `safe_speak()` — never call `play_audio_with_kokoro()` directly; it skips empty string protection
-- Response must be conversational prose — no markdown, no bullet points, no headers (these are spoken aloud)
-- A chime plays after every Jarvis response so the user knows when to speak
+### Voice Output
+- A single speaker thread (`_speaker_worker`) owns one persistent output stream and drains `_SPEAK_Q` in order.
+- `say(text)` queues speech and returns immediately. `safe_speak()` adds empty-string protection. `chime()` queues the "your turn" tone.
+- `speak_stream()` flushes streamed LLM output one sentence at a time. It splits only on punctuation **followed by whitespace**, so `72.4` is not cut.
+- `wait_until_spoken()` must run before recording, or the mic hears Jarvis.
+- Responses are spoken: conversational prose only, with no markdown, bullets or headers.
 
 ### Microphone / Transcription Settings
-- Energy threshold: `200` (intentionally low — quiet environments)
-- Pause threshold: `1.5s` — wait this long after speech stops before transcribing
-- Phrase time limit: `45s` max per utterance
-- Timeout: `10s` waiting for speech to start
-- Do not change these without testing; they affect latency and false triggers significantly
+- Energy threshold `200`, `dynamic_energy_threshold = False` after a 0.3s calibration
+- Pause threshold `0.8s` (was 1.5s; dead air is felt directly as latency)
+- Timeout `10s` waiting for speech; phrase limit `45s`
+- Do not change these without testing: they affect latency and false triggers.
 
 ### Message History
-- `messages` list persists for the entire session in memory
-- System prompt is at `messages[0]` — memory retrieval mutates it each turn by appending the memory block
-- Tool results use `role: tool` with `tool_name` field (Ollama format, not OpenAI format)
-- No persistence between sessions — Pinecone is the only cross-session memory
+- `messages` persists for the whole session; the system prompt at `messages[0]` must stay byte-stable for prefix caching.
+- No persistence between sessions except Pinecone.
 
-### ComputerControlAgent Index
-- Indexes the entire home directory on first run, cached at `~/jarvis_ai/directory_cache.json`
-- Startup blocks `computer._index_thread.join()` before entering main loop
-- Call `computer.refresh_index()` if the file system has changed significantly
-- Skipped directories: `.git`, `.venv`, `__pycache__`, `node_modules`, `.Trash`, `Library`, `.cache`, `.npm`, `.conda`
-
-### Google OAuth
-- Shared credentials across Calendar and Gmail via `get_google_creds()`
-- Scopes: full calendar + gmail read/send/modify/labels
-- Token cached in `token.json` — auto-refreshes when expired
-- `credentials.json` must be present at project root
-
-### Spotify Auth
-- Token cached at `.spotify_token`
-- If no cached token on startup, browser opens for login — paste redirect URL when prompted
-- Requires an active Spotify device before playback/queue commands will work
+### Auth & Permissions
+- **Google**: `get_google_creds()` is shared by Calendar and Gmail (calendar + gmail read/send/modify/labels scopes). `token.json` auto-refreshes; if refresh fails (Google revokes after 7 days in Testing mode), a browser login runs. `credentials.json` must be at the project root.
+- **Spotify**: token at `.spotify_token`; the first run opens a browser login. Playback commands need an active Spotify device.
+- **Reminders**: needs Automation permission for the terminal/Python under System Settings → Privacy & Security → Automation. User text is passed as JSON argv, never concatenated into the script.
 
 ---
 
@@ -151,14 +155,28 @@ SPOTIPY_CLIENT_ID=
 SPOTIPY_CLIENT_SECRET=
 SPOTIPY_REDIRECT_URI=
 PINECONE_API_KEY=
-ELEVENLABS_API_KEY=        # Not active yet — reserved for final release
+ELEVENLABS_API_KEY=        # Inactive, reserved for final release
 ```
+
+---
+
+## Testing
+
+```bash
+python tests.py              # everything except the microphone test
+python tests.py --quick      # structural checks only, no model calls
+python tests.py voice        # interactive microphone check
+python tests.py cache tools  # named suites only
+python tests.py --list       # show suite names
+```
+
+Tool suites check which tool the model **chooses** and never execute it, so they are safe against live accounts. `jarvis.py` is guarded by `if __name__ == "__main__"` so tests can import it.
 
 ---
 
 ## Division of Labour
 
-### Ruban and CLAUDE writes
+### Ruban and Claude write
 - `jarvis.py` main loop logic and intent routing
 - Memory retrieval and storage logic
 - Voice pipeline orchestration (record → transcribe → speak)
@@ -168,39 +186,41 @@ ELEVENLABS_API_KEY=        # Not active yet — reserved for final release
 
 ### Claude Code generates
 - Boilerplate method scaffolding inside new agent classes
-- `available_functions` dict entries and `tools=[]` list entries when adding new agents
+- `GROUP_BY_CLASS` and `GROUP_KEYWORDS` entries when adding new agents
 - Helper/utility functions (formatters, parsers, error handlers)
 - New agent class shells following the existing pattern
 
 ---
 
-## Development Notes
+## Known Limitations
+- No wake word; `exit` intent ends the process.
+- `r.listen(timeout=10)` raises `WaitTimeoutError` on silence, which is uncaught in `main_loop()`, so the session ends without saving memories.
+- One tool pass per command: tool A's output cannot feed tool B.
+- `messages` grows unbounded within a session, and the summarise instruction stays in history.
+- The system prompt says Jarvis has no memory between sessions, which contradicts the Pinecone memories injected each turn.
+- Weather tools need latitude/longitude and there is no geocoding tool, so the model guesses coordinates.
+- The all-tools retry also fires when the model correctly answers without a tool.
 
-### Current Limitations to Be Aware Of
-- No multi-turn tool chaining — if a task requires tool A's output to feed tool B, the model must handle this in a single `tool_calls` response
-- `classify_intent()` with `llama3.2:1b` occasionally misclassifies ambiguous requests — check intent logs if a tool isn't firing when expected
-- Memory retrieval injects into system prompt on every turn, which grows `messages[0]` over a long session
-- ElevenLabs functions exist but are commented out — do not remove them, they are the target production audio stack
+## Roadmap (mirrors PROGRESS.md)
+1. **Always-on wake word** (pvporcupine or openWakeWord): idle → conversation → idle, instead of exiting.
+2. **Multi-step agent loop**: keep calling tools until the model stops, capped, so results can chain.
+3. **Memory upgrades**: cross-session summaries, recency-weighted recall, history trimming, background extraction.
+4. **Platform features**: restore ComputerControlAgent (macOS app/file control, recoverable from commit `3027c57`), menu-bar status icon, ElevenLabs voice for the final release.
 
-### Planned Improvements
-- Migrate main LLM from Ollama → Anthropic Claude API (same pattern as AreaCompAgent migration)
-- Activate ElevenLabs TTS + STT for final release quality
-- Add menu bar app (`rumps`) — status icon that reflects idle/listening/thinking/speaking state
-- Add `research()` and `crawl_webpages()` to `WebSearchAgents` (stubs already exist)
-- Replace `zero-shot-classification` intent classifier (commented out) — current `llama3.2:1b` approach is the replacement
-- Improve chime sound quality (`play_chime()`)
-- Connect Obsidian vault as human-readable memory backend (currently Pinecone only)
-- Add multi-turn tool chaining (currently one tool pass per command)
-- Add message history pruning to prevent `messages[0]` bloat over long sessions
+Also under consideration: migrating the main LLM from Ollama to the Claude API for more reliable tool choice.
 
-### Running the Project
+---
+
+## Running the Project
 ```bash
-# Ensure Ollama is running with required models pulled
-ollama pull qwen2.5:14b
+pip install -r requirements.txt
+
+# Ollama must be running with these models pulled
+ollama pull qwen2.5:7b
 ollama pull llama3.2:1b
 
-# Ensure Spotify has an active device open before starting
+# Open Spotify on a device before using music commands
 
 python jarvis.py
 ```
-Startup sequence: Kokoro loads (background thread) → ComputerControl indexes (background thread) → both join → main loop starts.
+Startup sequence: Kokoro loads (background thread) while `prewarm()` loads both Ollama models and Whisper → both join → `main_loop()` starts.
