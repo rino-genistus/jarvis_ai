@@ -253,6 +253,25 @@ AGENT_TOOLS = {
     },
 }
 
+# Tools that change something rather than look it up. When one of these was
+# offered and none has run, an answer is held back: qwen will read the
+# calendar, then say "I've cancelled your standup" without cancelling it.
+CHANGES = {
+    "create_event", "update_calendar_event", "delete_calendar_event",
+    "send_email", "reply_to_email", "mark_as_read", "mark_as_unread", "trash_email",
+    "remove_email_from_trash", "send_draft",
+    "add_reminder", "complete_reminder", "delete_reminder", "update_reminder", "create_reminder_list",
+    "create_playlist", "add_song_to_playlist",
+    "set_preference", "forget_preference",
+}
+
+# Deletes and sends: Jarvis asks before running these, because they can't be
+# taken back and a mis-heard name or a guessed id would cost the user.
+CONFIRM = {
+    "delete_calendar_event", "trash_email", "delete_reminder",
+    "send_email", "reply_to_email", "send_draft",
+}
+
 # How many tools a request gets before the fallback to its whole agent
 MAX_PICKED = 4
 # Sent when no word matches: the agent's first (most common) tools

@@ -94,6 +94,29 @@ def speech_seconds(samples, threshold=0.5):
     return speech_chunks * VAD_CHUNK / 16000
 
 
+class SpeechDetector:
+    """
+    Silero VAD over a live stream, one VAD_CHUNK (40 ms) at a time, keeping
+    its state between chunks. mic.py uses it to decide when the user has
+    finished talking.
+    """
+
+    def __init__(self):
+        global _vad_session
+        if _vad_session is None:
+            ensure_models()
+            _vad_session = _session("silero_vad.onnx")
+        self._h = np.zeros((2, 1, 64), dtype=np.float32)
+        self._c = np.zeros((2, 1, 64), dtype=np.float32)
+
+    def probability(self, chunk):
+        """Speech probability for one VAD_CHUNK of int16 samples."""
+        audio = (np.asarray(chunk, dtype=np.int16) / 32767).astype(np.float32)
+        out, self._h, self._c = _vad_session.run(None, {"input": audio[None], "h": self._h, "c": self._c,
+                                                        "sr": np.array(16000, dtype=np.int64)})
+        return float(out[0][0])
+
+
 class WakeWordDetector:
 
     def __init__(self, vad_threshold=0.5):

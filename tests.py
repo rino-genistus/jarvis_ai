@@ -339,7 +339,7 @@ def suite_cache():
     """
     header("cache")
     j = load_jarvis()
-    from ollama import chat
+    chat = j.chat   # thinking off for models that would think first
 
     if "weather" not in j.TOOL_GROUPS:
         skip("prefix cache checks", "built around the weather tools, which are off")
@@ -348,7 +348,7 @@ def suite_cache():
     base = j.tool_messages("what's the weather in Boston right now", [])
 
     def tool_call():
-        return chat(model="qwen2.5:7b", messages=base, tools=tools,
+        return chat(model=j.MAIN_MODEL, messages=base, tools=tools,
                     keep_alive=j.OLLAMA_KEEP_ALIVE)
 
     print("  warming the prefix...")
@@ -366,7 +366,7 @@ def suite_cache():
         {"role": "user", "content": "Summarize the tool results naturally in Jarvis's voice. "
                                     "Two sentences at most. Do not call any more tools."},
     ]
-    summary = chat(model="qwen2.5:7b", messages=summary_messages, tools=tools,
+    summary = chat(model=j.MAIN_MODEL, messages=summary_messages, tools=tools,
                    keep_alive=j.OLLAMA_KEEP_ALIVE, options=j.GEN_OPTIONS)
     check("summarisation does not call another tool", not summary.message.tool_calls,
           str([t.function.name for t in (summary.message.tool_calls or [])]))
@@ -385,7 +385,7 @@ def suite_tools():
     """Does the model pick the right tool, and get the date right."""
     header("tools")
     j = load_jarvis()
-    from ollama import chat
+    chat = j.chat   # thinking off for models that would think first
     from datetime import datetime, timedelta
 
     now = datetime.now()
@@ -416,13 +416,13 @@ def suite_tools():
     misses = []
     for text, expected in cases:
         group, tools = j.select_tools(text)
-        r = chat(model="qwen2.5:7b", tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
+        r = chat(model=j.MAIN_MODEL, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
                  options=det, messages=j.tool_messages(text, []))
         called = [c.function.name for c in (r.message.tool_calls or [])]
         via = ""
         if not called and len(j.TOOL_GROUPS.get(group, [])) > len(tools):
             # What handle_turn does next: retry with the whole agent
-            r = chat(model="qwen2.5:7b", tools=j.TOOL_GROUPS[group], keep_alive=j.OLLAMA_KEEP_ALIVE,
+            r = chat(model=j.MAIN_MODEL, tools=j.TOOL_GROUPS[group], keep_alive=j.OLLAMA_KEEP_ALIVE,
                      options=det, messages=j.tool_messages(text, []))
             called = [c.function.name for c in (r.message.tool_calls or [])]
             via = " (whole-agent retry)" if called else ""
@@ -449,7 +449,7 @@ def suite_tools():
             friday = d.strftime("%Y-%m-%d")
             break
     group, tools = j.select_tools("remind me to call mom on Friday at 2pm")
-    r = chat(model="qwen2.5:7b", tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
+    r = chat(model=j.MAIN_MODEL, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE,
              messages=j.tool_messages("remind me to call mom on Friday at 2pm", []))
     args = (r.message.tool_calls or [{}])
     due = ""
@@ -459,11 +459,163 @@ def suite_tools():
           f"got {due!r}, expected {friday}")
 
 
+def suite_loop():
+    """
+    The agent loop chains tool calls — find an event, then change it — never
+    claims a change it didn't make, and asks before deletes and sends. Runs
+    whole turns through
+    handle_turn against a fake calendar and inbox: every tool that changes
+    something is replaced by a recorder, so no real account is touched.
+    """
+    header("loop")
+    j = load_jarvis()
+    import functools
+    if "calendar" not in j.TOOL_GROUPS or "email" not in j.TOOL_GROUPS:
+        skip("agent loop", "built around the calendar and Gmail tools, which are off")
+        return
+    j.kokoro_ready.wait()
+
+    events = [
+        {"id": "evt_dentist", "summary": "Dentist appointment",
+         "start": "2026-09-30T10:00:00-04:00", "end": "2026-09-30T11:00:00-04:00"},
+        {"id": "evt_standup", "summary": "Team standup",
+         "start": "2026-09-30T15:00:00-04:00", "end": "2026-09-30T15:30:00-04:00"},
+    ]
+    emails = [{"id": "m1", "from": "Priya Shah", "subject": "Project proposal review",
+               "snippet": "Could you review the proposal by Friday?"}]
+    writes, spoken = [], []
+    real = dict(j.TOOL_REGISTRY)
+
+    def stub(name, returns=None):
+        # wraps() keeps the real name, signature and docstring, so the model
+        # sees exactly the schema it would in production
+        @functools.wraps(real[name])
+        def fn(**kwargs):
+            if returns is not None:
+                return returns
+            writes.append(name)
+            return {"status": "ok"}
+        j.TOOL_REGISTRY[name] = fn
+
+    stub("get_calendar_events", events)
+    stub("get_unread_emails", emails)
+    stub("search_email", emails)
+    for name in j.tool_catalog.CHANGES:
+        if name in real:
+            stub(name)
+    real_say, real_chime, real_listen = j.say, j.chime, j.listen_for_reply
+    j.say, j.chime = spoken.append, (lambda: None)
+    asked = []
+    answer = [""]
+    def fake_listen():
+        asked.append(spoken[-1] if spoken else "")
+        return answer[0]
+    j.listen_for_reply = fake_listen
+
+    # (request, the user's answer if Jarvis asks, the changes expected)
+    cases = [
+        ("Move my dentist appointment to Thursday at the same time.", "", {"update_calendar_event"}),
+        ("Cancel my team standup tomorrow.", "Yes, go ahead.", {"delete_calendar_event"}),
+        ("Cancel my team standup tomorrow.", "No, leave it.", set()),
+        ("Send an email to priya@example.com saying I'll review the proposal tomorrow.", "Yes.",
+         {"send_email"}),
+        ("Read my unread emails and block an hour on my calendar tomorrow to follow up on them.", "",
+         {"create_event"}),
+        ("Okay, what did I put on my calendar for tomorrow?", "", set()),
+    ]
+    try:
+        for text, reply, expected in cases:
+            writes.clear(); spoken.clear(); asked.clear()
+            answer[0] = reply
+            j.messages[:] = j.messages[:1]
+            start = time.time()
+            j.handle_turn(text, [])
+            took = time.time() - start
+            said = " ".join(spoken)
+            confirmable = bool(expected & j.tool_catalog.CONFIRM) or (reply.startswith("No") and "Cancel" in text)
+            label = text[:40] + (f" / {reply!r}" if reply else "")
+            if expected:
+                check(f"makes the change: {label!r}", expected <= set(writes),
+                      f"{sorted(writes) or 'nothing changed'} in {took:.1f}s — said {said[:70]!r}")
+            else:
+                check(f"changes nothing: {label!r}", not writes,
+                      f"{sorted(writes) or 'no changes'} in {took:.1f}s — said {said[-70:]!r}")
+            if confirmable:
+                check(f"asks first: {label!r}", bool(asked), repr(asked[0]) if asked else "never asked")
+            elif "update_calendar_event" in expected or "create_event" in expected:
+                check(f"doesn't ask for a move or a new event: {text[:30]!r}", not asked,
+                      repr(asked[0]) if asked else "")
+    finally:
+        j.TOOL_REGISTRY.clear()
+        j.TOOL_REGISTRY.update(real)
+        j.say, j.chime, j.listen_for_reply = real_say, real_chime, real_listen
+        j.messages[:] = j.messages[:1]
+
+
+def suite_listen():
+    """
+    mic.endpoint(), the recorder's start and stop decisions, on synthetic room
+    audio: Kokoro speech at speaking volume over noise at a measured room
+    floor (~270), with pauses and a quieter background voice. No microphone.
+    """
+    header("listen")
+    j = load_jarvis()
+    import numpy as np
+    import mic
+    j.kokoro_ready.wait()
+    rate, floor = mic.WHISPER_RATE, 270
+    rng = np.random.default_rng(1)
+
+    def speech(text, peak=9000):
+        a = np.concatenate([np.asarray(x) for _, _, x in j.kokoro_pipeline(text, voice="am_michael")])
+        a = np.interp(np.arange(0, len(a), 1.5), np.arange(len(a)), a)
+        loud = np.flatnonzero(np.abs(a) > 0.02 * np.abs(a).max())   # drop Kokoro's own padding
+        a = a[loud[0]:loud[-1] + 1]
+        return a / np.abs(a).max() * peak
+
+    def silence(seconds):
+        return np.zeros(int(seconds * rate))
+
+    def listen(parts, timeout=10):
+        audio = np.clip(np.concatenate(parts) + rng.normal(0, floor, sum(map(len, parts))),
+                        -32768, 32767).astype(np.int16)
+        used = [0]
+        def chunks():
+            for i in range(0, len(audio) - mic.CHUNK + 1, mic.CHUNK):
+                used[0] += 1
+                yield audio[i:i + mic.CHUNK]
+        result = mic.endpoint(chunks(), mic.NOISE_MULTIPLIER * floor, timeout=timeout)
+        return result, used[0] * mic.CHUNK_SECONDS
+
+    command = speech("Move my dentist appointment to Thursday at the same time.")
+    result, stopped = listen([silence(1), command, silence(2)])
+    lag = stopped - (1 + len(command) / rate)
+    check("a command is kept whole", result is not None and result is not mic.NOISE
+          and len(result) >= len(command), f"{len(result) / rate:.2f}s kept" if result is not None else "nothing")
+    check("recording ends within 0.8 s of the last word", lag < 0.8, f"{lag:.2f}s")
+
+    first, rest = speech("Remind me to call"), speech("mom on Friday at two.")
+    result, _ = listen([silence(1), first, silence(0.35), rest, silence(2)])
+    check("a short pause mid-sentence doesn't end it",
+          result is not None and result is not mic.NOISE and len(result) >= len(first) + len(rest),
+          f"{len(result) / rate:.2f}s kept" if result is not None else "nothing")
+
+    tv = speech("And now the weather for the weekend ahead across the region.", peak=1500)
+    result, stopped = listen([silence(1), command, tv, silence(1)])
+    lag = stopped - (1 + len(command) / rate)
+    check("a quieter voice afterwards doesn't hold it open", lag < 1.0, f"ended {lag:.2f}s after the command")
+
+    result, _ = listen([silence(0.5), tv, silence(1)], timeout=3)
+    check("a quieter voice alone never starts a recording", result is None, repr(result))
+    result, _ = listen([silence(4)], timeout=3)
+    check("silence times out", result is None, repr(result))
+
+
 def suite_latency():
     """Full budget. Compares each stage against the target it was tuned to."""
     header("latency")
     j = load_jarvis()
-    from ollama import chat
+    chat = j.chat   # thinking off for models that would think first
     import numpy as np
 
     j.kokoro_ready.wait()
@@ -499,9 +651,9 @@ def suite_latency():
 
     group, tools = j.select_tools("what's the weather in Boston right now")
     msgs = j.tool_messages("what's the weather in Boston right now", [])
-    chat(model="qwen2.5:7b", messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)  # warm
+    chat(model=j.MAIN_MODEL, messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)  # warm
     t = time.time()
-    chat(model="qwen2.5:7b", messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)
+    chat(model=j.MAIN_MODEL, messages=msgs, tools=tools, keep_alive=j.OLLAMA_KEEP_ALIVE)
     results.append(("tool selection", time.time() - t, 3.0))
 
     t = time.time()
@@ -541,6 +693,17 @@ INTENT_CASES = [
     ("Call me Captain from now on.", "tool"), ("What's the date next Friday?", "tool"),
     ("What's Sarah's phone number?", "tool"), ("Search my notes for the wifi password.", "tool"),
     ("How many days until Christmas?", "tool"), ("I live in Boston.", "tool"),
+    # Added with the embedding classifier, first scored unseen (qwen 18/20, embeddings 16/20)
+    ("Alright, thanks for your help, bye now.", "exit"), ("That'll do, cheers.", "exit"),
+    ("Okay, see you tomorrow.", "exit"), ("Nothing else for now.", "exit"),
+    ("Is it windy out there?", "tool"), ("Do I have anything on Saturday?", "tool"),
+    ("Play the next song.", "tool"), ("Remind me to take the bins out tonight.", "tool"),
+    ("Did Sarah reply to my email?", "tool"), ("Look up who won the game last night.", "tool"),
+    ("Turn it down a bit.", "tool"), ("What's my mom's phone number?", "tool"),
+    ("Thanks, that's really useful.", "chat"), ("What's the tallest mountain in the world?", "chat"),
+    ("I'm thinking about learning piano.", "chat"), ("Tell me something interesting.", "chat"),
+    ("My meeting went really well today.", "chat"), ("How do I make a good cup of coffee?", "chat"),
+    ("That's it, I finally fixed the bug.", "chat"), ("I'm good, how are you?", "chat"),
 ]
 
 
@@ -548,7 +711,8 @@ def suite_intent():
     """
     Intent routing — classifier plus decide_intent() — on labelled phrases.
     llama3.2:1b scored 13/29 on the first 29 of these and never recognised a
-    goodbye; the qwen few-shot classifier with the guards scored 28/29.
+    goodbye; the qwen few-shot classifier scored 34/35 on the first 35 and
+    the embedding classifier that replaced it matches that in ~10 ms.
     """
     header("intent")
     j = load_jarvis()
@@ -562,6 +726,12 @@ def suite_intent():
         print(f"        miss: {w}")
     check("intent routing on labelled phrases", score >= len(INTENT_CASES) - 2,
           f"{score}/{len(INTENT_CASES)}")
+    import time as _time
+    start = _time.time()
+    for text, _ in INTENT_CASES[:10]:
+        j.classify_intent(text)
+    each = (_time.time() - start) / 10
+    check("intent takes under 100 ms", each < 0.1, f"{each * 1000:.0f} ms each")
     exits = [t for t, w in INTENT_CASES if w == "exit"]
     check("every goodbye ends the conversation",
           all(j.decide_intent(t, j.classify_intent(t)) == "exit" for t in exits))
@@ -818,6 +988,8 @@ SUITES = {
     "audio": suite_audio,
     "cache": suite_cache,
     "tools": suite_tools,
+    "loop": suite_loop,
+    "listen": suite_listen,
     "latency": suite_latency,
     "intent": suite_intent,
     "prefs": suite_prefs,
@@ -829,7 +1001,7 @@ SUITES = {
 }
 
 QUICK = ["imports", "registry", "routing", "text"]
-DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "intent", "latency",
+DEFAULT = ["imports", "registry", "routing", "text", "audio", "cache", "tools", "loop", "listen", "intent", "latency",
            "wake", "memory", "prefs", "everyday", "recall"]
 
 

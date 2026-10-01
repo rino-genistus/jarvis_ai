@@ -10,6 +10,7 @@ onnxruntime
 SpeechRecognition
 PyAudio              # microphone backend for SpeechRecognition
 mlx-whisper
+parakeet-mlx           # speech to text (default); Whisper is the fallback
 kokoro
 sounddevice
 numpy

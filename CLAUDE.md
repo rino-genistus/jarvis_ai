@@ -1,7 +1,7 @@
 # CLAUDE.md — Jarvis AI
 
 Personal voice-controlled AI assistant running locally on Apple Silicon.
-"Hey Jarvis" → MLX Whisper transcribes → Ollama/qwen2.5:7b reasons and calls tools → Kokoro speaks back.
+"Hey Jarvis" → Parakeet (MLX) transcribes → Ollama/qwen2.5:7b reasons and calls tools → Kokoro speaks back.
 
 See `PROGRESS.md` for the public summary of what's built and what's next. Keep the two in sync.
 
@@ -14,7 +14,7 @@ jarvis_ai/
 ├── wake_listener.py   # Always-on entry point (what Jarvis.app runs): wake word + engine lifecycle
 ├── wake_word.py       # Lean "Hey Jarvis" detector: openWakeWord's ONNX models on onnxruntime
 ├── jarvis.py          # Engine: conversation loop, intent + tool routing, memory, TTS
-├── mic.py             # Command recording: room-fitted thresholds + speech check (light imports)
+├── mic.py             # Command recording: speech-detector end of speech, room-fitted loudness (light imports)
 ├── memory_store.py    # On-device vector memory: Chroma + Ollama embeddings
 ├── obsidian_store.py  # Obsidian vault: daily notes, topic notes, keyword recall fallback
 ├── preferences.py     # Standing preferences (data/preferences.json, mirrored to Obsidian)
@@ -74,12 +74,13 @@ engine process — spawned on first wake, ~2.7 GB warm (+ Ollama models)
 ### Conversation (jarvis.py)
 ```
 run_session(first_audio=None)
-  start: messages[0] = build_system_prompt()   (today's date + preferences)
+  start: messages[0] = build_system_prompt()   (dates + preferences)
+         warm_conversation()   (Ollama reads it in the background while the user speaks)
   loop:
     wait_until_spoken() → mic.record_command(follow_up=...)
         None after 10 s silence → end;  NOISE (loud but not speech) → skip
         ↓
-    transcribe() [whisper-small-mlx, from a numpy array — no ffmpeg or temp file]
+    transcribe() [Parakeet TDT 0.6B on MLX; Whisper small as fallback — numpy arrays, no ffmpeg]
         ↓  is_speech()? two non-speech results in a row → end
     handle_turn(text, transcript) → True on exit intent → end
   end: falling sleep tone → clear history → remember_in_background(transcript)
@@ -89,37 +90,48 @@ run_session(first_audio=None)
 ```
 clear lookup request? ── yes → select_tools() → acknowledgement() at ~0s → retrieve_memories() → tool
         │ no
-classify_intent() [qwen2.5:7b]  ║  retrieve_memories() [Chroma → Obsidian]    ← run in parallel
+classify_intent() [embeddings, ~10 ms]  ║  retrieve_memories() [Chroma → Obsidian]    ← run in parallel
         ↓
    ┌────────────────┼────────────────┐
  exit              tool             chat
    ↓                ↓                ↓
 streamed      acknowledgement()   qwen2.5:7b
 farewell      select_tools()      streamed reply
-              → tool call
-              → summarise
+              → run_tool_loop():
+                tool → result → next tool or answer
+                (up to 4 rounds)
         ↓
 speak_stream() → say() → speaker thread → Kokoro → sounddevice → chime
 ```
 
 ### Intent Classification
-`classify_intent()` uses `qwen2.5:7b` with worked examples (`INTENT_PROMPT`, temperature 0, 3 tokens) to return one of:
+`classify_intent()` returns one of these in about 10 ms, with no LLM call:
 - **`exit`**: the user is ending the conversation → streamed farewell, then `run_session` ends it
 - **`tool`**: needs real-world action or data → tool routing and a tool call
 - **`chat`**: general conversation → streamed `qwen2.5:7b` reply, no tools
+
+How it decides:
+- **Goodbyes** are recognised by their words (`GOODBYE`), and only those end a conversation. "That's it" counts only with "for now" or "thanks", so "that's it, I fixed the bug" isn't a goodbye.
+- Otherwise the command is embedded with `nomic-embed-text` (`classification:` prefix) and compared with the labelled phrases in `INTENT_EXAMPLES`. Each label scores the mean similarity of its `INTENT_NEIGHBOURS` (3) closest examples.
+- An `exit` reading becomes the runner-up: ending by mistake costs more than missing a goodbye, which ends on 10 s of silence anyway.
+- A `tool` reading needs words that point at a service (`route_groups()`); otherwise it's `chat`.
+- If the embedding model is unavailable, the rules alone decide: a request with service words is `tool`, anything else `chat`.
+
+This replaced a `qwen2.5:7b` few-shot call. On the first 35 labelled phrases both scored 34/35. But qwen took ~220 ms and pushed the conversation out of Ollama's prompt cache, so the reply that followed re-read everything: routing measured 0.3–7 s. On 20 phrases written afterwards and scored unseen, qwen got 18/20 and the embeddings 16/20; the misses were missing keywords, now added. All 55 are in `INTENT_CASES`, and the current score is 54/55. `INTENT_EXAMPLES` is written separately from `INTENT_CASES`, so the test stays a test: add a phrase to the examples when a kind of command is misread.
 
 `decide_intent(text, classified)` then applies two guards:
 - A **stated preference** (keywords in the `preferences` group: "I prefer", "from now on", "call me", "I live in") is always `tool`, so it's saved immediately.
 - A **request** (`looks_like_request()`: a `?`, a command verb up front, or an embedded "remind me" / "can you") whose keywords point at a lookup group (`LOOKUP_GROUPS`: weather, calendar, email, reminders, web, everyday) becomes `tool` even if the classifier said `chat`. Music is excluded, because "skip" and "play" turn up in ordinary talk.
 - Any other **statement** is never `tool`. Offered calendar tools for "my sister's birthday is next week", the model may create an event nobody asked for.
 
-Measured on the labelled phrases in `tests.py` (`INTENT_CASES`): the old `llama3.2:1b` classifier scored 13/29 on the original set and never recognised a goodbye. The qwen classifier plus the guards score 34/35 on the current set, for about 170 ms more per turn. Run `python tests.py intent` after changing either.
+Before qwen, a `llama3.2:1b` classifier scored 13/29 and never recognised a goodbye. Run `python tests.py intent` after changing the examples, the keywords or the guards.
 
 **Fast path:** when `decide_intent(text, "chat")` is already `tool` (a clear request with lookup keywords, or a stated preference) and the text isn't a goodbye (`GOODBYE`), the classifier is skipped. The guards would overrule it anyway. The acknowledgement is spoken at ~0 s, before memory recall and tool selection.
 
 ### Tool Routing (intent == 'tool')
 Tool selection time is prompt reading: qwen2.5:7b on the M4 reads about 200 tokens/s, and Ollama's single cache slot is usually taken by the previous chat or classifier call. All 55 schemas are about 5,400 tokens and make qwen ignore tools; all 14 Gmail schemas with the full system prompt measured 10.3 s cold. `select_tools()` narrows in two steps:
 1. **Agent:** `route_tools()` matches `GROUP_KEYWORDS` with no LLM call, then `classify_tool_group()` (`llama3.2:1b`) if nothing matched, then `ALL_TOOLS` as a last resort.
+   A request whose words match several groups ("read my emails and block time on my calendar") gets the picked tools of each, up to `MAX_TOOLS_OFFERED` (8), so the loop can chain across agents. The first group leads: it gives the acknowledgement, and the "not set up" reply if it's off.
 2. **Tools within the agent:** `tool_catalog.pick()` keeps only the tools whose `words` the request contains, at most `MAX_PICKED` (4), best match first, plus any tool they `needs` (moving an event needs `get_calendar_events` to find its id). A tool that's only there as a helper never leads. With no match, it sends the agent's first `FALLBACK_COUNT` (2) tools, so the most common reads go first in each agent's entry.
 
 `tool_catalog.AGENT_TOOLS` is `{agent class: {tool: Tool(words, ack, needs)}}`. `build_tool_groups()` raises at startup if a registered tool is missing from it or it names a tool no agent defines. A tool may be listed under a second agent to be offered in that group too (Apple Calendar under `Calendar_Agents`).
@@ -133,16 +145,53 @@ If the routed group yields no tool call:
    This exists because qwen2.5:7b narrates ("I'll check the weather at home…") or declines "play some jazz", even at temperature 0.
 2. Otherwise, the call is retried once with the agent's whole tool list (`TOOL_GROUPS[group]`). There is no retry with `ALL_TOOLS`, which would take about 30 s.
 
-### Tool Execution
+### Tool Execution: the Agent Loop
 1. Speak `acknowledgement(group, tools)`: a phrase from the leading tool's `ack` in `tool_catalog`, worded for the action ("Let me see what's come in." for unread email, "Sure, let me take that off your calendar." for a delete), never the same one twice in a row. It is queued, so it plays over everything that follows. A disabled group gets `not_set_up_reply()` instead.
-2. Build the short conversation with `tool_messages()`: `TOOL_PROMPT` (the persona in four lines, not the ~600-token system prompt) plus preferences, the last `TOOL_CONTEXT_TURNS` (4) turns in plain words, and the request prefixed with `date_reference()`. qwen gets weekdays wrong from an ISO date alone; the chat path gets the same date prefix.
-3. Call `qwen2.5:7b` with the picked tools.
-4. Execute each `tool_call` via `TOOL_REGISTRY[name](**args)`. Exceptions become a text result instead of crashing.
-5. Append results as `role: tool` messages with `tool_name` (Ollama format). The main `messages` history gets the call and results too, each cut to `TOOL_RESULT_HISTORY_CHARS`, for later chat turns.
-6. Ask for a two-sentence summary on the same short conversation **with the same tools list**, so Ollama only reads the new tool results. The request quotes the acknowledgement so the summary doesn't repeat it.
-7. Stream the summary to speech. If the summary comes back empty (qwen sometimes answers it with another tool call and no words), ask once more with no tools on offer.
+2. Build the short conversation with `tool_messages()`: `TOOL_PROMPT` (the persona in a few lines, not the ~600-token system prompt) plus preferences, the last `TOOL_CONTEXT_TURNS` (4) turns in plain words, and the request prefixed with `date_reference()` (today, tomorrow and the coming week by name). qwen gets weekdays wrong from an ISO date alone. The chat path has the same dates in its system prompt instead (see Prompt Cache).
+3. First call to `qwen2.5:7b` with the picked tools, at temperature 0 (`TOOL_CALL_OPTIONS`), then `DEFAULT_CALLS` and the whole-agent retry above if it made no call.
+4. `run_tool_loop()` repeats, up to `MAX_TOOL_STEPS` (4) rounds:
+   - `run_tool_calls()` executes each call via `TOOL_REGISTRY`. Arguments the tool doesn't take are dropped (qwen once invented `toolbench_rapidapi_key`), a call identical to one already made this turn isn't run again, and exceptions become a text result.
+   - Results go in as `role: tool` messages. The main `messages` history gets the calls and results too, each cut to `TOOL_RESULT_HISTORY_CHARS` (400), for later chat turns. Every character there is read again by the next chat turn: at 1,200 a chat after the weather took 3.8 s to its first word.
+   - A note restates the request: if the tools so far only looked something up and the request asks for a change, make it now; only when every part is done, give the result in two sentences.
+   - The model either calls the next tool or answers. Every step uses the same messages, appended to, and the same tools, so Ollama only reads what's new.
+5. **Unmade-change guard.** `tool_catalog.CHANGES` lists the tools that change something. While one is on offer and none has run, and the request isn't an information question (`INFO_QUESTION`: "what did I put on my calendar"), a step is read in full before anything is spoken. If it answers without making the change, `push_for_change()` tells the model nothing has changed yet. If it still only says it's about to act (`ABOUT_TO_ACT`), it gets told once more. If it answers again, that answer stands, since the request may not have asked for a change after all.
+6. Once no change is pending, steps are streamed, so the answer starts at its first sentence. `speak_stream(already_said=)` skips any sentence identical to one already spoken this turn; qwen tends to open by repeating the acknowledgement.
+7. After `MAX_TOOL_STEPS`, or an empty answer, one last call with no tools asks what was and wasn't done.
+8. **Deletes and sends are confirmed first.** Every call goes through `run_tool_calls()`. Before any tool in `tool_catalog.CONFIRM` runs (`delete_calendar_event`, `trash_email`, `delete_reminder`, `send_email`, `reply_to_email`, `send_draft`), `confirm_calls()` asks once for the whole round:
+   - `confirmation_question()` has qwen phrase it from what it just found ("Are you sure you want to cancel the team standup scheduled for tomorrow at 3:00 PM?"). It uses the loop's messages and tools, so the cache holds. `CONFIRM_FALLBACKS` is used if that fails.
+   - `listen_for_reply()` waits for playback, chimes and records for up to `CONFIRM_TIMEOUT` (8 s) with the follow-up loudness bar.
+   - `is_yes()` needs a clear yes (`SAYS_YES`), and any no word (`SAYS_NO`) wins. Silence or anything unclear counts as no.
+   - A declined call isn't run. The model is told the action wasn't done and not to retry it, and a repeat of the same call is refused.
 
-Measured with a cold cache: tool selection 1.8–3.8 s, down from 6–8 s. Most of what remains is the tool itself (Gmail 2.8 s, Reminders 4–5 s through AppleScript) and reading its output (unread email is about 1,200 tokens, around 6 s).
+Wording of the note in step 4, measured on find-then-change requests at temperature 0:
+
+| Wording | Changes made |
+|---|---|
+| "call the next tool, otherwise answer" | 0 of 3 |
+| restate the request, change first, then answer | 3 of 3 |
+| the same, plus "go straight to the result" | 0 of 3 |
+
+Any hint to hurry to the answer makes qwen describe the change as done instead of making it. At the default temperature, it made the change in about half of runs.
+
+`python tests.py loop` runs these chains through `handle_turn` against a fake calendar and inbox, with every change tool replaced by a recorder and the spoken yes/no faked. It covers both a yes and a no to a cancel, and a confirmed send.
+
+Measured with a cold cache: tool selection 1.8–3.8 s, down from 6–8 s. A find-then-change request takes two or three model calls, roughly 15–25 s in total. Most of the rest is the tool itself (Gmail 2.8 s, Reminders 4–5 s through AppleScript) and reading its output (unread email is about 1,200 tokens, around 6 s). At temperature 0, qwen writes full ISO timestamps in date arguments, which roughly doubles a calendar call's length.
+
+### Prompt Cache
+Ollama keeps a prompt cache per slot, so a request that starts with the same tokens as the last one only reads what's new. Measured first-word times across chat, chat, tool, chat, chat:
+
+| Change | First turn | Chat after chat | Chat after a tool turn |
+|---|---|---|---|
+| Before (qwen intent check) | 4.1 s | 1.4–1.7 s | 5.4 s |
+| Embedding intent check, dates in the system prompt | 3.9 s | 0.5–0.6 s | 3.8 s |
+| `TOOL_RESULT_HISTORY_CHARS` 1,200 → 400 | 3.7 s | 0.6 s | 2.5 s |
+| `warm_conversation()` | **0.8 s** | **0.5–0.6 s** | **2.5 s** |
+
+What keeps it warm:
+- **Nothing else runs on the conversation's slot.** The intent check no longer calls qwen.
+- **History matches what was sent.** The chat path used to add `date_reference()` to a copy of the last message and store it without the dates, so the next turn missed the cache from that message on. The dates are now in `build_system_prompt()`, fixed for the conversation.
+- **The system prompt is read early.** `warm_conversation()` sends it with `num_predict: 1` in the background as each conversation starts, while the user is still speaking.
+- **One slot is enough.** Ollama 0.34 keeps its own prompt cache in RAM (up to 8 GB): when another prompt takes the slot, the idle conversation is saved and restored in about 10 ms. `OLLAMA_NUM_PARALLEL=2` was measured against one slot on the same conversation, twice each, and made no difference (chat after a tool turn 2.44–2.51 s with one slot, 2.46–2.54 s with two), so it isn't set. It would cost about 230 MB per extra slot.
 
 ### Memory System
 Each session is saved once it ends, on a background thread (`remember_in_background`). The thread is non-daemon and tracked, so `shutdown()` / `flush_memories()` wait for it.
@@ -196,12 +245,16 @@ Standing preferences the user states once and expects kept:
 | `hey_jarvis_v0.1` + melspectrogram, embedding, Silero VAD | Wake word | onnxruntime (listener process) |
 | `qwen2.5:7b` | Intent classification, reasoning, tool calling, summarisation, memory extraction | Ollama (local) |
 | `llama3.2:1b` | Tool-group fallback when no keyword matches | Ollama (local) |
-| `mlx-community/whisper-small-mlx` | Speech-to-text | MLX (Apple Silicon) |
+| `mlx-community/parakeet-tdt-0.6b-v2` | Speech-to-text | MLX (parakeet-mlx) |
+| `mlx-community/whisper-small-mlx` | Speech-to-text fallback (`JARVIS_STT=whisper`) | MLX (Apple Silicon) |
 | `hexgrad/Kokoro-82M` (voice `af_heart`) | Text-to-speech | Kokoro (local) |
 | `nomic-embed-text` | Memory embeddings (768-d) | Ollama (local) |
 
 - Ollama `keep_alive` is `JARVIS_IDLE_UNLOAD_MINUTES + 5` minutes, not forever. `shutdown()` unloads the models explicitly (`generate(..., keep_alive=0)`, and `embed(..., keep_alive=0)` for the embedding model), and the bound frees them even after a crash. `prewarm()` loads all three.
 - Spoken replies are capped with `GEN_OPTIONS = {"num_predict": 160}`.
+- `MAIN_MODEL` (`JARVIS_MODEL`, default `qwen2.5:7b`) is used for every qwen call. `chat()` wraps `ollama.chat` and turns thinking off for models that think first (`THINKING_FAMILIES`: qwen3, deepseek-r1, gpt-oss).
+- **Offline model loading:** Kokoro, Parakeet and Whisper each ask Hugging Face for newer files on every load. On a slow network that hung startup for minutes. Once all three are in `~/.cache/huggingface/hub`, `jarvis.py` sets `HF_HUB_OFFLINE=1` before importing them; set `HF_HUB_OFFLINE=0` to allow update checks. Full startup is about 7.7 s.
+- **Speech to text:** Parakeet measured 0.15 s per command against Whisper small's 0.37 s on eight spoken commands, with about the same memory (~650 MB), fewer errors ("Priya" where Whisper heard "PREA") and the same punctuation, which `looks_like_request()` relies on. parakeet-mlx 0.5.2's default bfloat16 path fails in `get_logmel`, so audio goes in as float32. If Parakeet fails, `transcribe()` switches to Whisper for the rest of the run.
 
 ### Wired Up but Inactive
 - **ElevenLabs TTS** (`eleven_turbo_v2_5`, voice `k7IRoeykhdGZUkTeJ1ID`): `play_audio_with_text_eleven_labs()`
@@ -279,15 +332,18 @@ With nothing configured at all, the voice pipeline, chat, memory, Reminders, eve
 - Responses are spoken: conversational prose only, with no markdown, bullets or headers.
 
 ### Microphone / Transcription Settings (mic.py)
-A fixed energy threshold of 200 in a room whose background sat at about 270 meant 87% of silence counted as speech. Recording ran to the 45 s cap, Whisper transcribed the noise ("ʕᴗᴗᴗ…", "When my plane gets here"), and the conversation never ended. The defences, in order:
-1. **Room-fitted threshold:** `set_noise_floor()` takes the listener's measured noise floor and sets the threshold to `NOISE_MULTIPLIER` (2.5×) for the first command after the wake word. Follow-ups use `JARVIS_FOLLOW_UP_LOUDNESS` (default 4×), because they come without a wake word and a TV or other people would otherwise keep a conversation going. The minimum is 200. Standalone `python jarvis.py` measures the room with `calibrate()` instead.
-2. **Speech check:** every recording is run through Silero VAD (`wake_word.speech_seconds`). Under `MIN_SPEECH_SECONDS = 0.3` it returns `NOISE` and is never transcribed.
-3. **Transcript check:** `is_speech()` rejects transcripts that are mostly non-letters or Whisper's stock phrases for silence ("Thank you.", "you"). Two in a row end the conversation.
+`record_command()` streams 40 ms chunks from sounddevice into `endpoint()`, which decides where the command starts and ends. `endpoint()` is a plain function over chunks, so `tests.py listen` can drive it with synthetic audio.
+- **Start:** 3 of the last 4 chunks are both speech (Silero VAD ≥ 0.5, `wake_word.SpeechDetector`) and louder than the threshold. `PRE_ROLL` (0.3 s) before that is kept, so the first word isn't clipped.
+- **Keep going:** a chunk counts if it's as loud as the threshold, or if the detector hears speech (≥ 0.35) at `KEEP_LOUDNESS` (half) of it. Silero is less sure of some voices; on synthetic speech it dipped to 0.3 inside words, which cut "remind me to call … mom" short when every chunk had to pass it.
+- **End:** `END_SILENCE` (0.6 s, `JARVIS_END_SILENCE`) of neither. Measured on synthetic speech: the recording ends 0.53 s after the last word (the old energy recorder needed 0.8 s of quiet, and loudness fades slowly). Pauses up to ~0.45 s mid-sentence are kept, and a quieter voice afterwards (a TV) ends it 0.77 s after the command. Only `TAIL` (0.15 s) of the silence is passed on.
+- **Noise:** under `MIN_SPEECH_SECONDS` (0.3 s) of detected speech returns `NOISE`, which is never transcribed.
 
-Other settings:
-- Pause threshold `0.8 s` (was 1.5 s; dead air is felt directly as latency).
-- `LISTEN_TIMEOUT = 10 s` of silence ends the conversation; phrase limit `45 s`.
-- Recordings are returned as 16 kHz float32 numpy arrays, which Whisper takes directly.
+The threshold, and why:
+A fixed energy threshold of 200 in a room whose background sat at about 270 meant 87% of silence counted as speech. Recording ran to the 45 s cap, Whisper transcribed the noise ("ʕᴗᴗᴗ…", "When my plane gets here"), and the conversation never ended. So:
+1. **Room-fitted threshold:** `set_noise_floor()` takes the listener's measured noise floor and sets the threshold to `NOISE_MULTIPLIER` (2.5×) for the first command after the wake word. Follow-ups use `JARVIS_FOLLOW_UP_LOUDNESS` (default 4×), because they come without a wake word and a TV or other people would otherwise keep a conversation going. The minimum is 200. Standalone `python jarvis.py` measures the room with `calibrate()` instead.
+2. **Transcript check:** `is_speech()` rejects transcripts that are mostly non-letters or stock phrases for silence ("Thank you.", "you"). Parakeet turns pure noise into "Yeah.", which the speech check above keeps from reaching it. Two in a row end the conversation.
+
+Other settings: `LISTEN_TIMEOUT = 10 s` of silence ends the conversation; phrase limit `45 s`. Recordings are returned as 16 kHz float32 numpy arrays.
 
 ### Message History
 - `messages` holds the current conversation only. `run_session` clears everything after `messages[0]` when a conversation ends.
@@ -319,6 +375,9 @@ Other settings:
 | `JARVIS_IDLE_UNLOAD_MINUTES` | How long the engine stays warm, default 10 | |
 | `JARVIS_WAKE_THRESHOLD` | Wake sensitivity, default 0.5; raise it if Jarvis triggers falsely | |
 | `JARVIS_FOLLOW_UP_LOUDNESS` | How much louder than the room a follow-up must be, default 4; raise it if background voices keep conversations going | |
+| `JARVIS_END_SILENCE` | Seconds of silence that end a command, default 0.6; raise it if Jarvis cuts you off mid-sentence | |
+| `JARVIS_STT` | `parakeet` (default) or `whisper` | |
+| `JARVIS_MODEL` | Main Ollama model, default `qwen2.5:7b`; for comparison runs | |
 
 Calendar and Gmail need `credentials.json` (a Google Cloud OAuth desktop client) in the project folder instead of a key.
 
@@ -330,6 +389,8 @@ Calendar and Gmail need `credentials.json` (a Google Cloud OAuth desktop client)
 python tests.py              # everything except the microphone test
 python tests.py --quick      # structural checks only, no model calls
 python tests.py intent       # intent routing on 35 labelled phrases (needs Ollama)
+python tests.py loop         # agent loop: chains, no false claims, confirms deletes/sends (needs Ollama)
+python tests.py listen       # recorder start/stop on synthetic room audio, no microphone
 python tests.py wake memory prefs everyday   # need no API keys, Ollama or jarvis.py
 python tests.py recall       # vector memory in a temp folder (needs Ollama)
 python status.py             # is the running Jarvis healthy?
@@ -368,7 +429,6 @@ python tests.py --list       # show suite names
 - **Dates in plain chat still depend on qwen.** Date questions route to `resolve_date` and are exact. But a date mentioned in passing in chat, and then in memory, can still be wrong.
 - **Background voices** (TV, other people) pass the speech check. The louder follow-up bar holds them off, but not a loud TV next to the Mac. `JARVIS_FOLLOW_UP_LOUDNESS` is the knob.
 - One remaining intent miss in the test set: "Can you help me write a poem about rain?" routes to weather.
-- One tool pass per command: tool A's output cannot feed tool B.
 - `messages` grows unbounded within a conversation, and the summarise instruction stays in history.
 - The all-tools retry also fires when the model correctly answers without a tool.
 - A cold wake (engine retired) takes about 6 s before the first answer starts. The command itself is recorded during that time.

@@ -1,10 +1,24 @@
+import os
+from pathlib import Path
+
+# Kokoro, Parakeet and Whisper each ask Hugging Face for newer files every
+# time they load, even when the models are already on disk. When the network
+# is slow that check hung startup for minutes (measured: 325 s for a test run
+# that takes 7). Once all three are downloaded, load them from disk only.
+# Set HF_HUB_OFFLINE=0 to let them check for updates again.
+_HF_CACHE = Path(os.getenv("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+_SPEECH_MODELS = ("hexgrad--Kokoro-82M", "mlx-community--parakeet-tdt-0.6b-v2",
+                  "mlx-community--whisper-small-mlx")
+if all((_HF_CACHE / f"models--{name}").is_dir() for name in _SPEECH_MODELS):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
 from elevenlabs.play import play
 import os
 import speech_recognition as sr
 import mlx_whisper
-from ollama import chat, embed, generate, ChatResponse, Message
+from ollama import chat as _ollama_chat, embed, generate, ChatResponse, Message
 import time
 from agents import (Calendar_Agents, WebSearchAgents, WeatherSearch, SpotifyAgent, GmailAgent,
                     RemindersAgent, EverydayToolsAgent, PreferencesAgent)
@@ -35,7 +49,21 @@ IDLE_UNLOAD_MINUTES = float(os.getenv("JARVIS_IDLE_UNLOAD_MINUTES", "10"))
 # shutdown() unloads them explicitly, and this bound frees them even if the
 # engine crashes before it gets the chance.
 OLLAMA_KEEP_ALIVE = f"{int(IDLE_UNLOAD_MINUTES) + 5}m"
-OLLAMA_MODELS = ("qwen2.5:7b", "llama3.2:1b")
+# The model behind intent, tools, chat and memory. JARVIS_MODEL swaps it for
+# comparison runs (tests.py, the model benchmark) without code changes.
+MAIN_MODEL = os.getenv("JARVIS_MODEL", "qwen2.5:7b")
+OLLAMA_MODELS = (MAIN_MODEL, "llama3.2:1b")
+
+# Models that reason step by step before answering unless told not to. For a
+# voice assistant that's seconds of silence per call, so it's switched off.
+THINKING_FAMILIES = ("qwen3", "deepseek-r1", "gpt-oss")
+
+
+def chat(**kwargs):
+    """ollama.chat, with thinking off for models that would otherwise think first."""
+    if str(kwargs.get("model", "")).startswith(THINKING_FAMILIES):
+        kwargs.setdefault("think", False)
+    return _ollama_chat(**kwargs)
 
 # Cap spoken replies. Generation and playback both scale with length, and a
 # 73 token answer is already 7.6 seconds of speech.
@@ -212,9 +240,11 @@ GROUP_KEYWORDS = {
                 "storm", "hurricane", "tornado", "weather alert", "weather warning"),
     "reminders": ("remind", "reminder", "task list", "to-do", "todo", "don't let me forget"),
     "calendar": ("calendar", "schedule", "meeting", "appointment", "event", "am i free",
-                 "what's on", "whats on", "book me"),
+                 "what's on", "whats on", "book me", "standup", "stand-up", "one-on-one",
+                 "1:1", "call with", "lunch with", "dinner with", "anything on", "do i have anything"),
     "music": ("play ", "spotify", "song", "track", "album", "artist", "playlist",
-              "skip", "pause the", "volume", "shuffle", "what's playing", "whats playing"),
+              "skip", "pause the", "volume", "shuffle", "what's playing", "whats playing",
+              "turn it up", "turn it down", "louder", "quieter"),
     "email": ("email", "inbox", "gmail", "unread", "reply to", "send a mail", "draft"),
     "web": ("search the web", "look up", "google", "search for", "find online",
             "latest news", "research"),
@@ -233,7 +263,8 @@ REQUEST_OPENERS = {"what", "what's", "whats", "how", "is", "are", "will", "does"
                    "remind", "add", "create", "set", "schedule", "book", "send", "reply", "move",
                    "cancel", "delete", "make", "put", "list", "email", "mark", "trash", "draft",
                    "play", "pause", "resume", "skip", "stop", "shuffle", "queue", "turn", "next",
-                   "previous", "complete", "update", "change", "clear"}
+                   "previous", "complete", "update", "change", "clear", "reschedule", "rename",
+                   "push", "block", "save", "reply", "forward", "open", "note", "text", "call"}
 EMBEDDED_REQUEST = re.compile(r"\b(remind me|can you|could you|would you|please|i need you to|"
                               r"i want you to|i'd like you to|let me know)\b")
 
@@ -295,6 +326,30 @@ def route_tools(text):
     return None, None
 
 
+def route_groups(text):
+    """Every group whose keywords the command contains, in GROUP_KEYWORDS order."""
+    lowered = text.lower()
+    return [group for group, words in GROUP_KEYWORDS.items() if any(word in lowered for word in words)]
+
+
+def date_reference(days=8):
+    """
+    Today plus the coming days spelled out by name. Given only an ISO date,
+    qwen2.5:7b works out weekdays wrong, so "remind me Friday" lands on the
+    wrong day — and "next Friday" gets stored in memory as the wrong date.
+    """
+    now = datetime.now()
+    upcoming = ", ".join(
+        (now + timedelta(days=offset)).strftime("%A %Y-%m-%d")
+        for offset in range(days)
+    )
+    tomorrow = now + timedelta(days=1)
+    return (f"Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}; "
+            f"tomorrow is {tomorrow.strftime('%A %Y-%m-%d')}. "
+            f"Dates coming up: {upcoming}. "
+            f"Use these exact dates for any day the user names.")
+
+
 def build_system_prompt():
     """
     The system prompt, rebuilt at the start of every conversation so today's
@@ -302,12 +357,11 @@ def build_system_prompt():
     warm for hours. Stable within a conversation, which keeps Ollama's prefix
     cache intact.
     """
-    current_date = datetime.now().strftime("%A, %B %d, %Y")
     return f"""
     You are JARVIS (Just A Rather Very Intelligent System), an advanced AI assistant built to serve as a highly capable, loyal, and intelligent personal assistant.
 
     ## Context
-    Today's date is {current_date}. Use this for any scheduling, calendar, or time-related tasks.
+    {date_reference()} Use these for any scheduling, calendar, or time-related tasks.
 
     ## Personality
     You speak with quiet confidence and calm authority. Your tone is casual but sharp — like a trusted right-hand who knows you well and doesn't waste your time. You have a dry wit that surfaces naturally, never forced. You are direct, precise, and never pad responses with fluff. You treat your user with the kind of familiar respect a close, highly competent aide would — you anticipate their needs and you're always in their corner.
@@ -466,7 +520,11 @@ def wait_until_spoken():
 SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 
 
-def speak_stream(stream_response):
+def _same_words(a, b):
+    return re.sub(r"[^a-z0-9 ]", "", a.lower()).split() == re.sub(r"[^a-z0-9 ]", "", b.lower()).split()
+
+
+def speak_stream(stream_response, tool_calls=None, already_said=()):
     """
     Consume a streaming Ollama response and hand each finished sentence to the
     speaker as soon as it appears.
@@ -474,16 +532,32 @@ def speak_stream(stream_response):
     Jarvis starts talking after the first sentence rather than after the last
     token, which is most of the perceived latency on a long answer.
 
-    Returns the full text so it can still be appended to the message history.
+    Pass a list as `tool_calls` to collect any tool calls the response makes;
+    the agent loop streams every step, since any one of them may be the answer.
+    A sentence identical to one in `already_said` isn't spoken again: qwen
+    sometimes opens its answer by repeating the acknowledgement.
+
+    Returns what was spoken, so it can be appended to the message history.
     """
     buffer = ""
-    spoken_any = False
-    full = []
+    spoken = []
+
+    def _speak(sentence):
+        sentence = sentence.strip()
+        if not sentence:
+            return
+        if any(_same_words(sentence, earlier) for earlier in already_said):
+            print(f"Not repeating: {sentence}")
+            return
+        say(sentence)
+        spoken.append(sentence)
+
     for part in stream_response:
+        if tool_calls is not None and part.message.tool_calls:
+            tool_calls.extend(part.message.tool_calls)
         piece = part.message.content or ""
         if not piece:
             continue
-        full.append(piece)
         buffer += piece
         # Only flush on a sentence boundary — Kokoro's prosody falls apart if
         # it is fed half a clause at a time.
@@ -491,16 +565,12 @@ def speak_stream(stream_response):
             match = SENTENCE_END.search(buffer)
             if not match or match.end() == 0:
                 break
-            sentence, buffer = buffer[:match.end()].strip(), buffer[match.end():]
-            if sentence:
-                say(sentence)
-                spoken_any = True
-    if buffer.strip():
-        say(buffer)
-        spoken_any = True
-    if not spoken_any:
+            sentence, buffer = buffer[:match.end()], buffer[match.end():]
+            _speak(sentence)
+    _speak(buffer)
+    if not spoken and not tool_calls:
         print("Warning: empty response, nothing to speak")
-    return "".join(full).strip()
+    return " ".join(spoken)
 
 def play_audio_with_text_eleven_labs(text):
     """
@@ -537,14 +607,43 @@ def record_audio_and_transcribe_elevenlabs():
         return transcription.text
 
 WHISPER_MODEL = "mlx-community/whisper-small-mlx"
+# Parakeet TDT 0.6B on MLX: measured on eight spoken commands, 0.15s each
+# against Whisper small's 0.37s, about the same memory (~650 MB), and fewer
+# errors (it heard "Priya" where Whisper heard "PREA"). Punctuates just as
+# well, which looks_like_request() relies on. JARVIS_STT=whisper switches back.
+PARAKEET_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+STT_ENGINE = os.getenv("JARVIS_STT", "parakeet")
+_parakeet = None
+
+
+def _parakeet_text(samples):
+    global _parakeet
+    import mlx.core as mx
+    from parakeet_mlx.audio import get_logmel
+    if _parakeet is None:
+        from parakeet_mlx import from_pretrained
+        _parakeet = from_pretrained(PARAKEET_MODEL)
+    # float32: parakeet-mlx 0.5.2's default bfloat16 path fails in get_logmel
+    mel = get_logmel(mx.array(samples, dtype=mx.float32), _parakeet.preprocessor_config)
+    return _parakeet.generate(mel)[0].text
 
 
 def transcribe(samples):
     """
-    Speech to text with MLX Whisper. Takes 16 kHz float32 samples from mic.py.
+    Speech to text: Parakeet, or MLX Whisper if Parakeet is switched off or
+    fails to load. Takes 16 kHz float32 samples from mic.py.
     """
-    result = mlx_whisper.transcribe(samples, path_or_hf_repo=WHISPER_MODEL)
-    text = result["text"].strip()
+    global STT_ENGINE
+    text = None
+    if STT_ENGINE == "parakeet":
+        try:
+            text = _parakeet_text(samples)
+        except Exception as e:
+            print(f"Parakeet failed ({e}) — using Whisper from now on")
+            STT_ENGINE = "whisper"
+    if text is None:
+        text = mlx_whisper.transcribe(samples, path_or_hf_repo=WHISPER_MODEL)["text"]
+    text = text.strip()
     print("User: ", text)
     return text
 
@@ -556,22 +655,6 @@ def record_audio_and_transcribe_mlx_whisper():
     """
     samples = mic.record_command()
     return transcribe(samples) if samples is not None and samples is not mic.NOISE else ""
-
-
-def date_reference(days=8):
-    """
-    Today plus the coming days spelled out by name. Given only an ISO date,
-    qwen2.5:7b works out weekdays wrong, so "remind me Friday" lands on the
-    wrong day — and "next Friday" gets stored in memory as the wrong date.
-    """
-    now = datetime.now()
-    upcoming = ", ".join(
-        (now + timedelta(days=offset)).strftime("%A %Y-%m-%d")
-        for offset in range(days)
-    )
-    return (f"Today is {now.strftime('%A %Y-%m-%d')} at {now.strftime('%H:%M')}. "
-            f"Dates coming up: {upcoming}. "
-            f"Use these exact dates for any day the user names.")
 
 
 def extract_session_memory(conversation, known_topics=()):
@@ -590,7 +673,7 @@ def extract_session_memory(conversation, known_topics=()):
     """
     known = ", ".join(known_topics) if known_topics else "none yet"
     response = chat(
-        model='qwen2.5:7b',
+        model=MAIN_MODEL,
         keep_alive=OLLAMA_KEEP_ALIVE,
         format="json",
         options={"num_predict": 700},
@@ -734,44 +817,96 @@ def retrieve_memories(query: str, top_k: int = 5):
     return obsidian_store.search(query, top_k)
 
 
-INTENT_PROMPT = """Classify the user's message to a voice assistant. Reply with exactly one word: exit, tool, or chat.
+# Goodbyes, recognised by their words alone. "That's it" only with "for now"
+# or "thanks": "that's it, I finally fixed the bug" isn't a goodbye.
+GOODBYE = re.compile(r"\b(bye|goodbye|good night|goodnight|that's all|that'll be all|that is all|"
+                     r"that'll do|that's it for (now|today)|that's it,? thanks|that's everything|"
+                     r"i'm done|we're done|i'm all set|nothing else|talk (to you )?later|see you|"
+                     r"catch you later|go (back )?to sleep|stop listening)\b")
 
-exit = the user is ending the conversation: goodbyes, "that's all", "I'm done", "go to sleep".
-tool = the user wants something done or looked up: weather, calendar, email, reminders, music, the web, contacts, notes, exact dates, or saving a preference ("from now on...", "call me...").
-chat = everything else: questions answered from general knowledge, jokes, explanations, and statements or remarks about themselves.
+# Labelled phrases the intent classifier compares a command against. Written
+# separately from tests.py's INTENT_CASES, so the score there is on phrases
+# the classifier has never seen. Add a phrase here when a kind of command is
+# misread; `python tests.py intent` checks the result.
+INTENT_EXAMPLES = {
+    "exit": [
+        "Okay that's everything, thanks.", "Bye Jarvis.", "Alright, I'm good for now.", "See you later.",
+        "That's all I needed.", "Thanks, goodnight.", "We're done here.", "Stop listening.",
+        "Nothing else, thank you.", "Catch you later.", "No, that's it.", "Go back to sleep.",
+        "I'm all set, thanks.", "Talk to you tomorrow.",
+    ],
+    "tool": [
+        "What's the forecast for the weekend?", "Is it going to snow tonight?", "Do I have any meetings this afternoon?",
+        "Check my inbox.", "Set a reminder to water the plants.", "Put on some lo-fi music.", "Next track.",
+        "Turn the volume up.", "Look up the opening hours for the library.", "Schedule lunch with Alex on Monday.",
+        "Reply to Mark saying sounds good.", "What's on my to-do list?", "Find the email from my landlord.",
+        "Cancel my 4pm meeting.", "What time is it in Tokyo?", "How long until my birthday?",
+        "Read my latest email.", "What song is this?", "Find Mike's address in my contacts.",
+        "Check my notes for the gate code.", "From now on use metric units.", "What day is the 14th?",
+    ],
+    "chat": [
+        "How are you doing today?", "What do you think about remote work?", "Write me a short story about a dragon.",
+        "Why is the sky blue?", "I had a great workout this morning.", "That's funny.", "Who was the first person on the moon?",
+        "Give me some tips for focusing.", "I'm bored.", "What's the difference between a virus and bacteria?",
+        "My brother just got a new job.", "Can you explain quantum computing simply?", "Help me plan a birthday speech.",
+        "I played guitar for an hour yesterday.", "What's your favourite movie?", "That makes sense, thanks.",
+        "Translate good morning into Spanish.", "What should I cook for dinner?", "I don't feel like working today.",
+    ],
+}
+INTENT_NEIGHBOURS = 3      # a label's score is its mean similarity over this many closest examples
+_intent_bank = None        # (labels, unit vectors) for INTENT_EXAMPLES, built on first use
 
-Examples:
-"Thanks, that'll be all." -> exit
-"Okay, bye." -> exit
-"Go to sleep." -> exit
-"What's on my calendar tomorrow?" -> tool
-"Remind me to buy milk." -> tool
-"Play some music." -> tool
-"Skip this track." -> tool
-"Is it cold outside?" -> tool
-"Tell me a joke." -> chat
-"What's the capital of Japan?" -> chat
-"I had a long day at work." -> chat
-"Thanks, that's helpful." -> chat
 
-Message: "{text}"
-Answer:"""
+def _intent_vectors(texts):
+    # nomic-embed-text's prefix for classification tasks
+    response = embed(model=memory_store.EMBED_MODEL, input=["classification: " + t for t in texts],
+                     keep_alive=OLLAMA_KEEP_ALIVE)
+    vectors = np.array(response["embeddings"], dtype=np.float32)
+    return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
 
 def classify_intent(text):
     """
-    Returns 'exit', 'tool', or 'chat'.
+    Returns 'exit', 'tool', or 'chat', in about 10 ms and without the LLM.
 
-    qwen2.5:7b with worked examples, not llama3.2:1b. On a fixed set of 29
-    labelled phrases the 1B model scored 13 — it never once recognised a
-    goodbye — while this scores 27 for about 170ms more per turn. qwen is
-    already resident, so there's no load cost. decide_intent() then guards it.
+    The command is compared with labelled example phrases (INTENT_EXAMPLES)
+    by embedding, under two rules: only GOODBYE ends a conversation, and
+    'tool' needs words that point at a service (GROUP_KEYWORDS).
+    decide_intent() then guards the result.
+
+    The exit examples still count, as competition for the other labels, but
+    an exit reading becomes the runner-up: "That's it, I finally fixed the
+    bug" sits right next to "No, that's it." Ending a conversation by mistake
+    costs more than missing a goodbye, which ends on 10 s of silence anyway.
+
+    This replaced a qwen2.5:7b few-shot call. On tests.py's 35 labelled
+    phrases both score 34/35, but qwen took ~220 ms and, worse, pushed the
+    conversation out of Ollama's single prompt cache, so the reply that
+    followed re-read everything: routing measured 0.3–7 s. If the embedding
+    model is unavailable, the rules alone decide.
     """
-    response = chat(model='qwen2.5:7b', keep_alive=OLLAMA_KEEP_ALIVE,
-                    options={"num_predict": 3, "temperature": 0},
-                    messages=[{"role": "user", "content": INTENT_PROMPT.format(text=text)}])
-    word = (response.message.content.strip().lower().split() or ["chat"])[0].strip(".,\"'")
-    return word if word in ("exit", "tool", "chat") else "chat"
+    global _intent_bank
+    request, groups = looks_like_request(text), route_groups(text)
+    if GOODBYE.search(text.lower()) and not request:
+        return "exit"
+    try:
+        if _intent_bank is None:
+            labels = [label for label, phrases in INTENT_EXAMPLES.items() for _ in phrases]
+            _intent_bank = (np.array(labels), _intent_vectors([p for ps in INTENT_EXAMPLES.values() for p in ps]))
+        labels, bank = _intent_bank
+        similarity = bank @ _intent_vectors([text])[0]
+        scores = {label: float(np.sort(similarity[labels == label])[-INTENT_NEIGHBOURS:].mean())
+                  for label in INTENT_EXAMPLES}
+    except Exception as e:
+        print(f"Intent embedding failed ({e}) — deciding by rules")
+        return "tool" if request and groups else "chat"
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    best = ranked[0]
+    if best == "exit":
+        best = ranked[1]
+    if best == "tool" and not groups:
+        best = "chat"
+    return best
 
 
 def classify_tool_group(text):
@@ -821,21 +956,29 @@ def safe_speak(text):
 
 def prewarm():
     """
-    Load both Ollama models and Whisper during startup instead of on the user's
-    first command, which otherwise costs 4.4s + 2.3s + the Whisper load.
+    Load the Ollama models, the speech model and the intent examples during
+    startup instead of on the user's first command, which otherwise costs
+    4.4s + 2.3s + the speech model load.
     """
     try:
         for model in OLLAMA_MODELS:
             chat(model=model, keep_alive=OLLAMA_KEEP_ALIVE,
                  options={"num_predict": 1},
                  messages=[{"role": "user", "content": "hi"}])
-        mlx_whisper.transcribe(np.zeros(mic.WHISPER_RATE, dtype=np.float32),
-                               path_or_hf_repo=WHISPER_MODEL)
+        transcribe(np.zeros(mic.WHISPER_RATE, dtype=np.float32))   # loads the speech model
         if memory is not None:
             memory.search("warm up")    # loads the embedding model
+    except Exception as e:
+        print(f"Prewarm skipped: {e}")
+    try:
+        classify_intent("warm up")      # embeds the intent examples
         print("Models prewarmed")
     except Exception as e:
         print(f"Prewarm skipped: {e}")
+
+
+# Tools offered across all the agents one request touches
+MAX_TOOLS_OFFERED = 8
 
 
 def select_tools(text):
@@ -844,16 +987,30 @@ def select_tools(text):
     classifier, then only the tools within it that the request's words call
     for. Everything as a last resort. A group whose agent is off comes back
     with no tools.
+
+    A request that names more than one agent's work ("read this week's emails
+    and block time on my calendar") also gets the picked tools of the others,
+    so the agent loop can chain across them. The first group leads: it gives
+    the acknowledgement, and a "not set up" reply if it's off.
     """
-    group, _ = route_tools(text)
-    if group is None:
-        group = classify_tool_group(text)
-    if group is None:
+    groups = route_groups(text)
+    if not groups:
+        guess = classify_tool_group(text)
+        groups = [guess] if guess else []
+    if not groups:
         return "ALL", ALL_TOOLS
+    group = groups[0]
     if group not in TOOL_GROUPS:
         return group, []
-    names = tool_catalog.pick(CLASS_BY_GROUP[group], text)
-    return group, [TOOL_REGISTRY[n] for n in names if n in TOOL_REGISTRY] or TOOL_GROUPS[group]
+    tools = []
+    for g in groups:
+        if g not in TOOL_GROUPS:
+            continue
+        names = tool_catalog.pick(CLASS_BY_GROUP[g], text)
+        for method in [TOOL_REGISTRY[n] for n in names if n in TOOL_REGISTRY] or TOOL_GROUPS[g]:
+            if method not in tools:
+                tools.append(method)
+    return group, tools[:MAX_TOOLS_OFFERED]
 
 
 # For requests with no catalogue entry to phrase an acknowledgement from —
@@ -921,17 +1078,22 @@ def not_set_up_reply(group):
 # once another call has pushed it out of Ollama's cache, which is most turns.
 TOOL_PROMPT = """You are JARVIS, the user's personal assistant: calm, concise, with a dry wit.
 Everything you say is spoken aloud, so talk in plain sentences, never lists or markdown.
-Use the tools to do what the user asks. Never claim something was done that a tool didn't do or report.
+Use the tools to do what the user asks. A request can take several tool calls in a row: use what one
+returns to make the next, such as finding an event before moving it, or reading emails before
+scheduling time for them. Never guess an id, date or address a tool could tell you.
+Never claim something was done that a tool didn't do or report.
 Some messages begin with a bracketed note of what you know about the user; use it naturally."""
+
+# Rounds of tool calls one request may take before Jarvis must answer
+MAX_TOOL_STEPS = 4
 
 # Earlier turns given to the tool call, for follow-ups like "reply to that one"
 TOOL_CONTEXT_TURNS = 4
-# Tool output kept in the conversation for later turns; the tool call itself sees all of it
-TOOL_RESULT_HISTORY_CHARS = 1200
+# Tool output kept in the conversation for later turns; the tool call itself sees all of it.
+# Every character is read again by the next chat turn: at 1,200 a chat after
+# the weather took 3.8 s to its first word, mostly re-reading the forecast.
+TOOL_RESULT_HISTORY_CHARS = 400
 
-# A goodbye that happens to mention the weather is still a goodbye
-GOODBYE = re.compile(r"\b(bye|goodbye|good night|goodnight|that's all|that'll be all|that is all|"
-                     r"i'm done|we're done|go to sleep|stop listening)\b")
 
 
 def tool_messages(user_content, transcript):
@@ -945,14 +1107,280 @@ def tool_messages(user_content, transcript):
             + [{"role": "user", "content": f"[{date_reference()}] {user_content}"}])
 
 
+# Loop steps may carry a whole email body in their arguments, so they get more
+# room than a plain reply; the "two sentences" instruction keeps answers short.
+# Temperature 0: at the default, qwen made the change a find-then-change
+# request asked for in about half of runs, and otherwise described it as done.
+LOOP_OPTIONS = {"num_predict": 320, "temperature": 0}
+TOOL_CALL_OPTIONS = {"temperature": 0}
+
+
+# --- Confirming deletes and sends -------------------------------------------
+
+# How long to wait for a yes or no before leaving the action undone
+CONFIRM_TIMEOUT = 8
+# Checked first, so "no, don't cancel it" is a no despite the "cancel it"
+SAYS_NO = re.compile(r"\b(no|nope|nah|don't|do not|stop|wait|hold on|never ?mind|leave it|not yet|"
+                     r"not now|forget it)\b")
+SAYS_YES = re.compile(r"\b(yes|yeah|yep|yup|sure|do it|go ahead|go for it|confirm(ed)?|please|ok|okay|"
+                      r"sounds good|correct|absolutely|definitely|send it|delete it|cancel it|bin it|"
+                      r"that's right|affirmative)\b")
+
+# Fallbacks for when the model won't phrase the question
+CONFIRM_FALLBACKS = {
+    "delete_calendar_event": "Shall I delete that event?",
+    "trash_email": "Shall I bin that email?",
+    "delete_reminder": "Shall I delete that reminder?",
+    "send_email": "Shall I send it{to}?",
+    "reply_to_email": "Shall I send that reply?",
+    "send_draft": "Shall I send that draft?",
+}
+
+
+def is_yes(reply):
+    """True only for a clear yes. Silence, a no, or anything unclear leaves the action undone."""
+    lowered = reply.lower()
+    return bool(lowered) and not SAYS_NO.search(lowered) and bool(SAYS_YES.search(lowered))
+
+
+def listen_for_reply():
+    """
+    The user's answer to a question asked mid-task, as text — "" for silence
+    or noise. Waits for Jarvis to finish asking first, so he never hears
+    himself, and chimes like any other turn.
+    """
+    wait_until_spoken()
+    chime()
+    wait_until_spoken()
+    samples = mic.record_command(timeout=CONFIRM_TIMEOUT, follow_up=True)
+    if samples is None or samples is mic.NOISE:
+        return ""
+    text = transcribe(samples)
+    return text if is_speech(text) else ""
+
+
+def confirmation_question(calls, lean, tools):
+    """
+    One short spoken question naming what's about to happen: "Cancel Team
+    standup tomorrow at 3pm — shall I?". The model writes it, since it has the
+    event or email the call's id refers to; the same messages and tools as the
+    loop keep Ollama's cache, so only the request for a question is new.
+    """
+    planned = "; ".join(f"{c.function.name}({json.dumps(dict(c.function.arguments or {}), default=str)})"
+                        for c in calls)
+    try:
+        r = chat(model=MAIN_MODEL, tools=tools, keep_alive=OLLAMA_KEEP_ALIVE,
+                 options={"temperature": 0, "num_predict": 60},
+                 messages=lean + [{"role": "user", "content":
+                     f"[About to run: {planned}. Before it runs, ask the user to confirm in one short spoken "
+                     f"question that names what will happen, such as the event and its time or who the email "
+                     f"goes to. Don't use ids. Don't call any tools.]"}])
+        question = (r.message.content or "").strip()
+        if question and not r.message.tool_calls and "?" in question and len(question) < 200:
+            return question
+    except Exception as e:
+        print(f"Confirmation question failed: {e}")
+    first = calls[0].function
+    to = (first.arguments or {}).get("to", "")
+    return CONFIRM_FALLBACKS.get(first.name, "Shall I go ahead?").format(to=f" to {to}" if to else "")
+
+
+def confirm_calls(calls, lean, tools):
+    """Ask before deletes and sends. Returns (approved, what the user said)."""
+    question = confirmation_question(calls, lean, tools)
+    say(question)
+    reply = listen_for_reply()
+    approved = is_yes(reply)
+    print(f"Confirmation: {question!r} -> {reply!r} ({'approved' if approved else 'not approved'})")
+    return approved, reply
+
+
+def run_tool_calls(calls, lean, seen, tools):
+    """
+    Run one round of tool calls, adding each result to the tool conversation
+    and the main history. Returns how many were new: a call identical to one
+    already made this turn isn't run again, since its result is already there.
+
+    Deletes and sends (tool_catalog.CONFIRM) are asked about first, once for
+    the whole round. Declined, they're reported to the model as not done, and
+    a retry of the same call is refused.
+    """
+    lean.append({"role": "assistant", "content": "", "tool_calls": calls})
+    messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+
+    def key_of(call):
+        return (call.function.name, json.dumps(dict(call.function.arguments or {}), sort_keys=True, default=str))
+
+    risky = [c for c in calls if c.function.name in tool_catalog.CONFIRM and key_of(c) not in seen]
+    approved, reply = confirm_calls(risky, lean, tools) if risky else (True, "")
+
+    new = 0
+    for call in calls:
+        name, args = call.function.name, dict(call.function.arguments or {})
+        key = key_of(call)
+        if seen.get(key) == "declined":
+            result = "The user already said not to do this. Don't try it again."
+        elif key in seen:
+            result = "Already called with these arguments this turn; its result is above."
+        elif name not in TOOL_REGISTRY:
+            result = f"There is no tool called {name}."
+        elif call in risky and not approved:
+            seen[key] = "declined"
+            new += 1
+            heard = f'said "{reply}"' if reply else "didn't answer"
+            result = (f"Not done: asked to confirm, the user {heard}. Nothing was changed. "
+                      f"Don't try it again; tell them it's been left as it was.")
+            print(f"Skipped {name} — not confirmed")
+        else:
+            seen[key] = "done"
+            new += 1
+            tool = TOOL_REGISTRY[name]
+            # qwen now and then adds an argument the tool doesn't take (one
+            # run invented "toolbench_rapidapi_key"), which would fail the call
+            accepted = inspect.signature(tool).parameters
+            dropped = [k for k in args if k not in accepted]
+            args = {k: v for k, v in args.items() if k in accepted}
+            print(f"Calling {name} with {args}" + (f" (dropped {dropped})" if dropped else ""))
+            try:
+                result = tool(**args)
+            except Exception as e:
+                # Hand the failure back to the model as text so it can explain
+                # itself, or try another way, instead of crashing the session.
+                result = f"That tool failed: {e}"
+            print(f"Tool result: {result}")
+        lean.append({"role": "tool", "tool_name": name, "content": str(result)})
+        messages.append({"role": "tool", "tool_name": name, "content": str(result)[:TOOL_RESULT_HISTORY_CHARS]})
+    return new
+
+
+# Questions that ask for information, not a change: "what did I put on my
+# calendar", "did anyone add anything". "Can you move..." is left out on purpose.
+INFO_QUESTION = re.compile(r"^((hey|ok|okay|so|and|jarvis)[,.!]?\s+)*(what|what's|whats|when|where|which|who|"
+                           r"did|is|are|was|were|do|does|how)\b")
+
+# An answer that says it's about to act ("Let me go ahead and cancel it")
+ABOUT_TO_ACT = re.compile(r"\b(let me|i'll|i will|i'm going to|going to|go ahead)\b")
+
+
+def unmade_changes(tools, called, request):
+    """
+    The change tools on offer, if none of them has run yet this turn — the
+    request asked for a change that hasn't happened. Empty once one has, and
+    for information questions, whose "put" or "add" offered create_event
+    without asking for anything to be created.
+    """
+    if INFO_QUESTION.match(request.strip().lower()):
+        return []
+    offered = [t.__name__ for t in tools if t.__name__ in tool_catalog.CHANGES]
+    return [] if called & tool_catalog.CHANGES else offered
+
+
+def push_for_change(lean, tools, text, pending):
+    """
+    A non-streamed nudge when the model answered while a change is still
+    unmade. If the request really didn't ask for one, the model answers again
+    and that answer stands. An answer that only says it's about to act ("Let
+    me go ahead and cancel it") gets one more nudge. Returns (tool_calls, text).
+    """
+    for attempt in range(2):
+        print(f"Answer held back — no change made yet ({', '.join(pending)} on offer): {text[:80]!r}")
+        if text:
+            lean.append({"role": "assistant", "content": text})
+        lean.append({"role": "user", "content":
+                     f"[No {' or '.join(pending)} call has been made, so nothing has changed yet and saying "
+                     f"it's done would be untrue. If the request asks for that change, call the tool now "
+                     f"rather than describing it. If it doesn't, just answer what was asked, in two sentences "
+                     f"at most, without mentioning changes.]"})
+        r = chat(model=MAIN_MODEL, messages=lean, tools=tools, keep_alive=OLLAMA_KEEP_ALIVE,
+                 options=LOOP_OPTIONS)
+        calls, text = list(r.message.tool_calls or []), (r.message.content or "").strip()
+        if calls or not ABOUT_TO_ACT.search(text.lower()):
+            break
+    return calls, text
+
+
+def run_tool_loop(lean, tools, calls, ack, request):
+    """
+    The agent loop: run the tool calls, show the model the results, and let it
+    either call the next tool or answer — up to MAX_TOOL_STEPS rounds. This is
+    what lets one request chain steps: find an event, then move it; read the
+    week's emails, then block time on the calendar to answer them.
+
+    Once any change the request asked for is made (or none was asked for),
+    each step is streamed, because any one of them may be the answer and the
+    answer should start playing at its first sentence. Until then a step is
+    read in full first, so a claim that something was done when it wasn't is
+    caught before it's spoken (push_for_change).
+
+    Every call uses the same messages, appended to, and the same tools, so
+    Ollama only reads what's new each round. Returns everything Jarvis said
+    after the acknowledgement.
+    """
+    said = []
+    seen = {}      # call -> 'done' or 'declined'
+    called = set()
+    for step in range(1, MAX_TOOL_STEPS + 1):
+        step_start = time.time()
+        called.update(c.function.name for c in calls)
+        if not run_tool_calls(calls, lean, seen, tools):
+            print("Only repeated tool calls — answering with what's there")
+            break
+        # Wording measured on find-then-change requests at temperature 0:
+        #   "call the next tool, otherwise answer"             0 of 3 changes made
+        #   restate the request, change first, then answer    3 of 3
+        #   ... plus "go straight to the result"               0 of 3
+        # Any hint to hurry to the answer makes qwen describe the change as
+        # done instead of making it. speak_stream(already_said=) stops it
+        # repeating the acknowledgement instead.
+        lean.append({"role": "user", "content":
+                     f'[Tool results are in. The request was: "{request}". If the tools so far have only looked '
+                     f"something up and the request asks for a change, make that change now with the matching "
+                     f"tool. Only when every part is done, tell the user the result in two sentences at most.]"})
+        pending = unmade_changes(tools, called, request)
+        if pending:
+            r = chat(model=MAIN_MODEL, messages=lean, tools=tools,
+                     keep_alive=OLLAMA_KEEP_ALIVE, options=LOOP_OPTIONS)
+            calls, text = list(r.message.tool_calls or []), (r.message.content or "").strip()
+            if not calls:
+                calls, text = push_for_change(lean, tools, text, pending)
+            if not calls and text:
+                said.append(text)
+                safe_speak(text)
+                print(f"Step {step} took {time.time() - step_start:.2f}s — answered, no change made")
+                return " ".join(said)
+        else:
+            calls = []
+            text = speak_stream(chat(model=MAIN_MODEL, messages=lean, tools=tools, stream=True,
+                                     keep_alive=OLLAMA_KEEP_ALIVE, options=LOOP_OPTIONS),
+                                tool_calls=calls, already_said=[ack] + said)
+            if text:
+                said.append(text)
+        print(f"Step {step} took {time.time() - step_start:.2f}s"
+              + (f" — next: {[c.function.name for c in calls]}" if calls else " — answered"))
+        if not calls:
+            if text:
+                return " ".join(said)
+            # qwen occasionally answers with neither words nor a call, and
+            # Jarvis said nothing at all. Ask again below, with no tools on
+            # offer, so words are the only option.
+            print("Empty answer — asking again without tools")
+            break
+    else:
+        print(f"Reached {MAX_TOOL_STEPS} tool steps — answering with what's there")
+    lean.append({"role": "user", "content":
+                 "[No more tools. Tell the user what was done and what wasn't, in two sentences at most.]"})
+    final = speak_stream(chat(model=MAIN_MODEL, messages=lean, stream=True,
+                              keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS),
+                         already_said=[ack] + said)
+    return " ".join(said + [final]).strip()
+
+
 def handle_turn(transcribed_text, transcript):
     """
     Answer one command. Returns True when the user has ended the conversation.
 
     `transcript` collects the raw (speaker, text) turns for memory extraction.
     """
-    # Dispatch table and tool schemas both come from the shared registry
-    available_functions = TOOL_REGISTRY
     spoken = ""
     ack = None
     group = tools = None
@@ -1010,7 +1438,7 @@ def handle_turn(transcribed_text, transcript):
 
     if intent == 'exit':
         #User is leaving or conversation is done
-        completion = chat(model="qwen2.5:7b", messages=messages, stream=True,
+        completion = chat(model=MAIN_MODEL, messages=messages, stream=True,
                           keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
         spoken = speak_stream(completion)
         messages.append({"role": "assistant", "content": spoken})
@@ -1041,8 +1469,8 @@ def handle_turn(transcribed_text, transcript):
 
         lean = tool_messages(user_content, transcript)
         llm_start = time.time()
-        response: ChatResponse = chat(model='qwen2.5:7b', messages=lean, tools=tools,
-                                      keep_alive=OLLAMA_KEEP_ALIVE)
+        response: ChatResponse = chat(model=MAIN_MODEL, messages=lean, tools=tools,
+                                      keep_alive=OLLAMA_KEEP_ALIVE, options=TOOL_CALL_OPTIONS)
 
         # Some groups have an obvious default action. For a vague request like
         # "how hot is it outside", qwen2.5:7b narrates ("I'll check the weather
@@ -1065,62 +1493,31 @@ def handle_turn(transcribed_text, transcript):
         if not response.message.tool_calls and len(whole_group) > len(tools):
             print(f"No tool call from {[t.__name__ for t in tools]} — retrying with all {len(whole_group)} {group} tools")
             tools = whole_group
-            response = chat(model='qwen2.5:7b', messages=lean, tools=tools,
-                            keep_alive=OLLAMA_KEEP_ALIVE)
+            response = chat(model=MAIN_MODEL, messages=lean, tools=tools,
+                            keep_alive=OLLAMA_KEEP_ALIVE, options=TOOL_CALL_OPTIONS)
         print(f"Tool selection took {time.time() - llm_start:.2f}s")
 
-        if response.message.tool_calls: #Loops through all required tool calls to finish task
-            lean.append(response.message)
-            messages.append({"role": "assistant", "content": response.message.content or "",
-                             "tool_calls": response.message.tool_calls})
-            for tool_call in response.message.tool_calls:
-                if tool_call.function.name in available_functions:
-                    print(f"Calling {tool_call.function.name} with {tool_call.function.arguments}")
-                    try:
-                        result = available_functions[tool_call.function.name](**tool_call.function.arguments) #Calls tool calls to complete task
-                    except Exception as e:
-                        # Hand the failure back to the model as text so it can
-                        # explain itself instead of crashing the session.
-                        result = f"That tool failed: {e}"
-                    print(f"Tool result: {result}")
-                    lean.append({"role": "tool", "tool_name": tool_call.function.name, "content": str(result)})
-                    messages.append({"role": "tool", "tool_name": tool_call.function.name,
-                                     "content": str(result)[:TOOL_RESULT_HISTORY_CHARS]})
-
-            lean.append({
-                "role": "user",
-                "content": f'You have already said "{ack}" to the user. Now tell them what the tool results '
-                           "mean, naturally and without repeating that, in two sentences at most. "
-                           "Do not call any more tools."
-            }) #Summarizes what was just done
-
-            # Same messages and tools as the call above, so Ollama reuses the
-            # prompt it just read and only the tool results are new.
-            follow_up = chat(model='qwen2.5:7b', messages=lean, tools=tools,
-                             stream=True, keep_alive=OLLAMA_KEEP_ALIVE,
-                             options=GEN_OPTIONS)
-            spoken = speak_stream(follow_up)
-            if not spoken:
-                # qwen occasionally answers the summary request with another
-                # tool call and no words, and Jarvis said nothing at all. Ask
-                # again with no tools on offer, so words are the only option.
-                print("Empty summary — asking again without tools")
-                retry = chat(model='qwen2.5:7b', messages=lean, stream=True,
-                             keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
-                spoken = speak_stream(retry)
-        else:
+        calls = list(response.message.tool_calls or [])
+        pending = unmade_changes(tools, set(), transcribed_text) if group != "ALL" else []
+        if not calls and pending:
+            # "Reschedule the standup to 4pm" answered with "I've moved it"
+            # and no call at all
+            calls, text = push_for_change(lean, tools, response.message.content or "", pending)
+            response.message.content = text
+        if not calls:
             spoken = response.message.content or response.message.thinking or ""
             safe_speak(spoken)
+        else:
+            spoken = run_tool_loop(lean, tools, calls, ack, transcribed_text)
         messages.append({"role": "assistant", "content": spoken})
 
     else:  # chat
-        # Same dated copy as the tool path. Without it Jarvis states wrong dates
-        # ("next Friday" became a Wednesday), and memory then records them.
-        dated_messages = messages[:-1] + [{
-            "role": "user",
-            "content": f"[{date_reference()}] {messages[-1]['content']}"
-        }]
-        response = chat(model='qwen2.5:7b', messages=dated_messages, stream=True,
+        # The dates are in the system prompt (date_reference(), rebuilt each
+        # conversation), not on a copy of this message. The copy differed from
+        # what history stored, so the next turn missed Ollama's cache from the
+        # previous message on: a chat after a tool turn re-read 792 of 1,424
+        # tokens, about 4 s.
+        response = chat(model=MAIN_MODEL, messages=messages, stream=True,
                         keep_alive=OLLAMA_KEEP_ALIVE, options=GEN_OPTIONS)
         spoken = speak_stream(response)
         messages.append({"role": "assistant", "content": spoken})
@@ -1160,6 +1557,22 @@ def is_speech(text):
     return re.sub(r"[^a-z ]", "", text.lower()).strip() not in WHISPER_PHANTOMS
 
 
+def warm_conversation():
+    """
+    Have Ollama read the new system prompt while the user is still giving
+    their first command, so the first reply only reads that command. Without
+    it the first turn took 3.7 s to its first word, against ~0.6 s for the
+    turns after it. Runs in the background; a failure only costs that time.
+    """
+    def _warm():
+        try:
+            chat(model=MAIN_MODEL, messages=[messages[0]], keep_alive=OLLAMA_KEEP_ALIVE,
+                 options={"num_predict": 1})
+        except Exception as e:
+            print(f"Conversation warm-up skipped: {e}")
+    threading.Thread(target=_warm, daemon=True).start()
+
+
 def run_session(first_audio=None):
     """
     One conversation, from wake word to goodbye.
@@ -1174,6 +1587,7 @@ def run_session(first_audio=None):
     transcript = []
     pending = first_audio
     messages[0]["content"] = build_system_prompt()
+    warm_conversation()
     noise_in_a_row = 0
     while True:
         # Never start recording while Jarvis is still talking, or the mic picks
